@@ -2,21 +2,22 @@
 *.gen.*
 .godot/
 
-# Ignore library files but not the gdextension file
-project/bin/*
-!project/bin/android
-project/bin/android/*
-!project/bin/android/.gitkeep
-!project/bin/linux
-project/bin/linux/*
-!project/bin/linux/.gitkeep
-!project/bin/macos
-project/bin/macos/*
-!project/bin/macos/.gitkeep
-!project/bin/windows
-project/bin/windows/*
-!project/bin/windows/.gitkeep
-!project/bin/*.gdextension
+# Ignore library files but not the gdextension file (the addon's bin/ — was project/bin/)
+project/addons/opencv_aruco/bin/*
+!project/addons/opencv_aruco/bin/android
+project/addons/opencv_aruco/bin/android/*
+!project/addons/opencv_aruco/bin/android/.gitkeep
+!project/addons/opencv_aruco/bin/linux
+project/addons/opencv_aruco/bin/linux/*
+!project/addons/opencv_aruco/bin/linux/.gitkeep
+!project/addons/opencv_aruco/bin/macos
+project/addons/opencv_aruco/bin/macos/*
+!project/addons/opencv_aruco/bin/macos/.gitkeep
+!project/addons/opencv_aruco/bin/windows
+project/addons/opencv_aruco/bin/windows/*
+!project/addons/opencv_aruco/bin/windows/.gitkeep
+!project/addons/opencv_aruco/bin/*.gdextension
+!project/addons/opencv_aruco/bin/*.gdextension.uid
 
 # CMake's root bin/ build output (keep the empty platform dirs via .gitkeep)
 bin/*

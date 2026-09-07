@@ -21,7 +21,7 @@ config/icon="res://icon.svg"
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/aruco_export_guard/plugin.cfg")
+enabled=PackedStringArray("res://addons/opencv_aruco/plugin.cfg")
 
 [rendering]
 

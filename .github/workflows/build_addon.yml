@@ -1,0 +1,187 @@
+# Builds the opencv_aruco GDExtension for every supported platform (template_debug AND
+# template_release each) and packs the complete addon -- addons/opencv_aruco/ including all
+# binaries -- into one distributable zip. Unzipping that file into a Godot project root
+# installs the addon.
+#
+# Triggers: manually from the Actions tab, or by pushing a tag like v1.2.3 (which also
+# creates a GitHub release with the zip attached).
+#
+# Notes:
+# - OpenCV is built from source through Conan on the first run per platform (~15-30 min);
+#   the ~/.conan2 cache makes later runs fast. template_debug and template_release share the
+#   same OpenCV packages (the Conan build_type is always Release), which is why both targets
+#   are built in ONE job per platform.
+# - macOS is built arm64-only (Apple Silicon): Conan produces single-arch OpenCV, so a
+#   universal binary would need a second build + lipo. Add it here if Intel support matters.
+# - The android job builds the same lib that is checked in for local development; the zip
+#   always contains the freshly built one.
+name: Build addon zip
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          [
+            { platform: windows, arch: x86_64, os: windows-latest },
+            { platform: linux, arch: x86_64, os: ubuntu-22.04 },
+            { platform: macos, arch: arm64, os: macos-latest },
+            { platform: android, arch: arm64, os: ubuntu-22.04 },
+          ]
+
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Python + SCons; for android it also installs NDK r23c (= 23.2.8568313, the version
+      # godot-cpp pins and profiles/android-arm64 expects) and links it into the SDK so
+      # $ANDROID_HOME/ndk/23.2.8568313 exists on the runner.
+      - name: Setup godot-cpp
+        uses: ./godot-cpp/.github/actions/setup-godot-cpp
+        with:
+          platform: ${{ matrix.target.platform }}
+          windows-compiler: msvc
+
+      # SConstruct would bootstrap Conan itself, but installing it explicitly puts `conan`
+      # on PATH for the cache-shrink step below.
+      - name: Install Conan
+        shell: bash
+        run: python -m pip install "conan>=2.0"
+
+      - name: Restore Conan cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ hashFiles('conanfile.py', 'profiles/**') }}
+          restore-keys: |
+            conan2-${{ matrix.target.platform }}-${{ matrix.target.arch }}-
+
+      - name: Restore .scons_cache
+        uses: ./godot-cpp/.github/actions/godot-cache-restore
+        with:
+          scons-cache: ${{ github.workspace }}/.scons-cache/
+          cache-name: addon_${{ matrix.target.platform }}_${{ matrix.target.arch }}
+
+      - name: Build template_debug + template_release
+        shell: bash
+        env:
+          SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
+        run: |
+          scons target=template_debug platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }}
+          scons target=template_release platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }}
+
+      # Drop Conan's source/build trees before the post-job cache save: only the built
+      # packages are worth caching.
+      - name: Shrink Conan cache
+        shell: bash
+        run: conan cache clean "*" --source --build --temp || true
+
+      - name: Save .scons_cache
+        uses: ./godot-cpp/.github/actions/godot-cache-save
+        with:
+          scons-cache: ${{ github.workspace }}/.scons-cache/
+          cache-name: addon_${{ matrix.target.platform }}_${{ matrix.target.arch }}
+
+      - name: Windows - delete compilation side products
+        if: ${{ matrix.target.platform == 'windows' }}
+        shell: pwsh
+        run: |
+          Remove-Item project/addons/opencv_aruco/bin/windows/* -Include *.exp,*.lib,*.pdb -Force -ErrorAction SilentlyContinue
+
+      # Quest is THE deployment target -- verify the .so beyond "the link succeeded":
+      # right architecture, the GDExtension entry symbol is exported, and the Camera2 NDK
+      # libs are linked (without camera2ndk/mediandk the lib fails to load ON DEVICE with
+      # "undefined symbol ACameraManager_create" while everything looks fine at build time).
+      - name: Android - verify .so
+        if: ${{ matrix.target.platform == 'android' }}
+        shell: bash
+        run: |
+          for t in template_debug template_release; do
+            so="project/addons/opencv_aruco/bin/android/libopencv_aruco.android.${t}.arm64.so"
+            test -f "$so" || { echo "::error::$so missing"; exit 1; }
+            file "$so" | grep -q "aarch64" || { echo "::error::$so is not aarch64"; exit 1; }
+            nm -D "$so" | grep -q opencv_aruco_library_init || { echo "::error::entry symbol missing in $so"; exit 1; }
+            readelf -d "$so" | grep -q "libcamera2ndk" || { echo "::error::libcamera2ndk not linked in $so"; exit 1; }
+            readelf -d "$so" | grep -q "libmediandk" || { echo "::error::libmediandk not linked in $so"; exit 1; }
+            echo "$so OK ($(du -h "$so" | cut -f1))"
+          done
+
+      # Release gate on the platform where the checked-in OpenXR vendors binaries allow the
+      # full project to load headless: run the drop-in functional test against the
+      # template_debug build made above.
+      - name: Run headless drop-in test
+        if: ${{ matrix.target.platform == 'macos' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          curl -sSL -o godot.zip https://github.com/godotengine/godot/releases/download/4.7.1-stable/Godot_v4.7.1-stable_macos.universal.zip
+          unzip -q godot.zip
+          GODOT="./Godot.app/Contents/MacOS/Godot"
+          # The headless editor import completes its work but can crash during teardown on
+          # macOS -- tolerate its exit code; the test run below is the actual gate.
+          "$GODOT" --headless --path project --import || echo "import exited nonzero (teardown crash tolerated)"
+          "$GODOT" --headless --path project res://tests/drop_in_test.tscn
+
+      - name: Upload platform binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target.platform }}
+          path: project/addons/opencv_aruco/bin/${{ matrix.target.platform }}/
+
+  # Merge the per-platform binaries with the addon's scripts/config into one zip whose
+  # top-level folder is addons/, so it extracts straight into a Godot project root.
+  assemble:
+    runs-on: ubuntu-22.04
+    needs: build
+    permissions:
+      contents: write # create the release on tag pushes
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: _artifacts
+
+      - name: Assemble addon zip
+        shell: bash
+        run: |
+          mkdir -p staging/addons
+          cp -a project/addons/opencv_aruco staging/addons/
+          for d in _artifacts/bin-*; do
+            p="$(basename "$d")"; p="${p#bin-}"
+            mkdir -p "staging/addons/opencv_aruco/bin/$p"
+            cp -a "$d/." "staging/addons/opencv_aruco/bin/$p/"
+          done
+          find staging -name .gitkeep -delete
+          VERSION="${GITHUB_REF_NAME//\//-}"
+          ZIP="opencv_aruco-addon-${VERSION}.zip"
+          (cd staging && zip -qr "../$ZIP" addons)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          unzip -l "$ZIP"
+
+      - name: Upload addon zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv_aruco-addon
+          path: ${{ env.ZIP }}
+
+      - name: Create release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP" --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber

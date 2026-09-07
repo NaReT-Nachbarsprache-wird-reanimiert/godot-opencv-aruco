@@ -1,654 +1,101 @@
-# Named so consumers can type their reference to it (@export var marker_source: ArucoMarkerSource)
-# and get the public marker API below checked at edit time instead of as a runtime "Invalid call".
-class_name ArucoMarkerSource
+# Demo consumer for the opencv_aruco addon. Deliberately uses ONLY the standard Godot XR
+# marker-tracking route -- XRServer.tracker_added/tracker_removed + XRAnchor3D bound by tracker
+# name -- exactly like the "spatial entities manager" in the official OpenXR spatial entities
+# tutorial. Nothing in here knows where the trackers come from: swap ArucoMarkerTracking for
+# Godot's built-in OpenXR marker tracking (or run both) and this script keeps working, which is
+# the whole point of the addon.
+#
+# Per tracked marker it spawns an XRAnchor3D under the XROrigin3D with a box mesh sized from the
+# tracker's bounds_size. The anchor follows the tracker's "default" pose by itself;
+# show_when_tracked hides the box while the marker is lost (the addon invalidates the pose after
+# its grace period), and tracker_removed frees it.
 extends Node3D
 
-var processor: OpenCVProcessor
-# id -> patch Node3D, the ONE registry of live patches. Nodes are created on a marker's first
-# detection and freed once it has been missing for PATCH_LOST_TIMEOUT_MS; the scene file holds
-# none of them. Because an id is only ever added through _get_or_create_patch (which checks this
-# dictionary first) and only ever removed together with its node, one id can never own two nodes
-# nor swap onto another id's node. Main thread only -- detection tasks never touch it.
-var marker_nodes: Dictionary = {}
-# id -> Time.get_ticks_usec() of the last detection result that contained it. Drives the patch
-# deletion grace period AND, since it is no longer erased when a patch is freed, the public
-# marker_age_ms() below -- a consumer asking "how stale is my last good pose?" must still get an
-# answer after the mesh is gone.
-var _marker_last_seen: Dictionary = {}
-# id -> resolved size in meters for the C++ side. Rebuilt by _sync_marker_sizes, which runs in
-# _ready and then once per dispatch in _process -- but ONLY while no detection task is in flight,
-# so the unlocked read in _detect_frame never overlaps a write.
-var _marker_size_table: Dictionary = {}
-
-# Fallback physical side length, in meters, for every marker id WITHOUT a table entry below.
-# Used as the solvePnP marker size (sets the pose's metric scale) AND as the rendered cuboid's
-# side length (see _get_or_create_patch), so the two can never disagree.
-@export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_size := 0.1
-
-# Ground-truth lookup table: index = marker id (0-9), value = physical side length in meters.
-# 0 = unset -> that id falls back to aruco_patch_size (as do all ids >= 10 of DICT_4X4_50), so
-# an untouched table behaves exactly like the single-size setup before it existed.
-@export_range(0.01, 0.3, 0.001, "or_greater", "suffix:m") var aruco_patch_sizes: Array[float] = [
-	0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
-]
-
-# Rendered thickness (z) of a patch cuboid in meters -- x/y come from that id's marker size, so the
-# box overlays the printed marker at true size. Was the authored z-scale of the scene meshes.
+# Rendered thickness (z) of a marker box in meters -- x/y come from the tracker's bounds_size,
+# so the box overlays the printed marker at true size.
 const PATCH_THICKNESS := 0.01
-# How long a marker may be absent from detection results before its node is freed. Detection is
-# noisy (motion blur, glancing angles drop a marker for a frame or two), so deleting on the first
-# miss would make the mesh flicker; half a second bridges the dropouts and still feels immediate.
-const PATCH_LOST_TIMEOUT_MS := 500.0
-# ONE unit-cube mesh shared by every patch, as the scene's SubResource was before. Size is per
-# patch and lives in the MeshInstance3D's scale, never in the mesh.
+
+# tracker name -> XRAnchor3D. Keyed by name because that is what the XRServer signals carry;
+# an anchor is only ever created in _on_tracker_added (which checks this dict first) and only
+# ever removed together with its map entry, so one tracker can never own two anchors.
+var _anchors: Dictionary = {}
+# ONE unit-cube mesh shared by every anchor box; per-marker size lives in the MeshInstance3D's
+# scale, never in the mesh.
 var _patch_mesh := BoxMesh.new()
 
-# Single switch for ALL debug output, this script's and the C++ extension's. Off by default: with
-# no tcp_receiver.py listening the TCP reconnect logs alone would print once per second for the
-# whole session, and the detection timing below fires ~12x/s on the Quest. Errors are never gated
-# and print regardless.
-# Format for every debug line: "[opencv_aruco] [main_3d::function] event: key=value" -- the fixed
-# prefix is what makes them findable in logcat (adb logcat | grep opencv_aruco).
-@export var debug_prints_enabled := false:
-	set(value):
-		debug_prints_enabled = value
-		# Mirror every change into the C++ static right away. The extension gates its ACV_DBG lines
-		# on a flag that only GDScript can set, so pushing it once in _ready meant a toggle from the
-		# remote inspector of a RUNNING deploy silenced this script's prints while the extension kept
-		# logging. Assigning the property inside its own setter does not recurse in GDScript, and
-		# scene instantiation applies exported values before _ready -> the flag is already correct
-		# when the (printing) C++ constructor runs.
-		OpenCVProcessor.set_debug_prints_enabled(value)
-
-# --- Camera calibration (left Quest passthrough camera "50", native 640x480 frame) ---
-# Exported so they can be tuned in the inspector instead of hunting through code. Read-only
-# after _ready: detection tasks read them without a lock (same pattern as _marker_size_table),
-# so treat inspector edits as pre-run configuration, not live tuning.
-# Intrinsics (fx, fy, cx, cy) in pixels for the NATIVE 640x480 frame. _detect_frame scales all
-# four with the downscale factor at use time -- never bake that factor into these values.
-# (approximations: cx ~ width/2, cy ~ height/2)
-@export var camera_intrinsics := Vector4(435.37335635, 435.96983202, 320.84589009, 241.55014114)
-# OpenCV distCoeffs (k1, k2, p1, p2, k3) for the Quest passthrough lens; an EMPTY array means
-# "no distortion". These used to be hardcoded in the C++ side.
-@export var camera_distortion: PackedFloat64Array = [-0.00484306, 0.14036606, 0.00044449, -0.00108918, -0.29608385]
-# Detection resolution knob: 1.0 = native frame, 0.5 = half width AND half height, i.e. a quarter
-# of the pixels -> markedly cheaper detection, at the price of small or distant markers dropping
-# below the resolution the detector needs. _detect_frame hands it to the C++ side AND scales the
-# intrinsics above by the same factor; the two must always move together, which is why the factor
-# belongs here and never baked into camera_intrinsics.
-@export_range(0.1, 1.0, 0.05) var image_downscale_factor := 1.0
-# Physical passthrough-camera pose relative to the gyro/IMU reference, RAW from the Quest's
-# ACAMERA_LENS_POSE_ROTATION / _TRANSLATION (LENS_POSE_REFERENCE == GYROSCOPE).
-# The raw quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg X-flip
-# PLUS the camera's real ~11deg pitch. The C++ marker pose already contains that same 180deg
-# flip (its negate-Y/Z change of basis), so _ready multiplies by Quaternion(1,0,0,0) (=180deg
-# about X) to cancel the flip and keep ONLY the physical mounting tilt (-> _lens_pose).
-# The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
-# camera axes -> raw values, no sign flips. If markers land in the wrong place, the axis
-# convention is the knob: try the conjugate quaternion / flipped translation signs.
-@export var lens_rotation_raw := Quaternion(-0.99513953924179, 0.0030371833127, -0.00251883361489, 0.0983956977725)
-@export var lens_translation := Vector3(-0.03214744105935, -0.01810946315527, -0.06306969374418)
-# Derived ONCE from the exported raw values in _ready (before any detection task can exist).
-var _lens_pose := Transform3D.IDENTITY
-
-# Godot has a native CameraServer (Camera2) backend on Android since 4.5, so
-# CameraServerExtension is only needed on desktop (Windows). Keep this var UNTYPED and
-# instantiate via ClassDB so the script still parses on Android, where the
-# CameraServerExtension class isn't registered.
-var camera_extension
-var cam_texture: CameraTexture
-@onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
 @onready var xr_origin: XROrigin3D = $XROrigin3D
-@onready var xr_camera: XRCamera3D = $XROrigin3D/XRCamera3D
+@onready var cam_preview: TextureRect = $CameraLayer/CameraPreview
+@onready var marker_tracking: ArucoMarkerTracking = $ArucoMarkerTracking
 
-# --- Detection worker (Teil B) ---
-# On the Quest the OpenCV detection costs ~80ms, which run synchronously would cap the whole
-# app at ~10fps. We run ONLY the detection (detectMarkers + solvePnP) off the main thread, as
-# one-shot WorkerThreadPool tasks -- Godot owns the threads, so there is no Thread/Mutex/
-# Semaphore lifecycle to manage here. At most ONE task is in flight at a time; get_image()
-# and all scene-tree writes stay on the main thread (neither is thread-safe).
-# There is no pending-frame slot on this branch: frames are PULLED here, so instead of parking a
-# frame while the worker is busy we simply do not read one back (see _process).
-var _detect_task_id := -1              # WorkerThreadPool task id; -1 = no task in flight
-# output slots, written by the task; the main thread reads them only AFTER
-# wait_for_task_completion(), which is the synchronization point (no lock needed)
-var _result_markers: Dictionary = {}
-# id -> PackedVector2Array of the 4 marker corners in the frame's own pixel space, straight from
-# the C++ detector. Debug data for the TCP overlay ONLY -- the poses above are what the app runs on.
-var _result_corners: Dictionary = {}
-
-# --- Capture-latency compensation ---
-# The Image get_image() returns is OLDER than "now": sensor -> ISP -> CameraServer texture takes
-# 1-2 camera frames. Pairing those old pixels with the LIVE head pose bakes an error proportional
-# to head speed, so a fresh detection first "drags" with the head, then settles. We keep a short
-# timestamped head-pose history and sample the head pose from CAMERA_LATENCY_MS ago instead; that
-# pose travels with the frame, and the C++ side bakes the markers straight to world space with it.
-# This readback path has NO sensor timestamp, so this fixed guess is the only correction available
-# -- tune it on device: patch still drags WITH the head -> raise; patch lags behind the real marker
-# during motion -> lower.
-@export_range(0, 300, 1.0, "or_greater", "suffix:ms") var CAMERA_LATENCY_MS := 90.0
-
-var _xr_cam_pose_history: Array = []   # [t_usec, head Transform3D] pairs, newest last; main thread only
-
-
-#stream image of quest to laptop via tcp
-const TCP_HOST := "127.0.0.1"
-const TCP_PORT := 7007			#view available ports with adb reverse --list
-
-var stream_peer: StreamPeerTCP
-var _tcp_reconnect_timer := 0.0
-var _last_tcp_status := -1
-var _tcp_send_timer := 0.0
-const TCP_SEND_INTERVAL := 0.01
-# The frame the in-flight (or just finished) detection task is working on, kept so the streamer can
-# send it TOGETHER with that detection's corners -- the corners only exist once the worker is done,
-# so a frame sent at readback time could never carry them. Overwritten on every dispatch.
-var _stream_img: Image
-
-#######################################################################################################
-# --- Public marker API -------------------------------------------------------------------------
-# Consumers (avatar rigs, debug gizmos) address markers by ID, never by patch node. The patch nodes
-# are created and freed at runtime, so a NodePath to one is null at scene load and dangling after a
-# dropout; an id is stable -- it is the key the detector itself uses. The patches are a debug
-# RENDERING of this data, not the data.
-# Main thread only, same as everything else that touches marker_nodes.
-
-## Ids contained in the detection result just applied. For one-shot reactions; polling the getters
-## below from _process is equally fine and is what the rigs do (this node is their parent, so its
-## _process has already run when theirs does).
-signal markers_updated(ids: Array)
-
-# id -> last known WORLD pose. Deliberately NOT pruned alongside the patch nodes: a consumer holding
-# its last good pose through a dropout needs the pose to outlive the mesh. DICT_4X4_50 bounds this
-# at 50 entries, so it cannot grow without limit.
-var _marker_poses: Dictionary = {}
-
-
-## Last known world pose. IDENTITY if never detected -- pair with has_marker() if that would be
-## indistinguishable from a real pose for you.
-func get_marker_pose(id: int) -> Transform3D:
-	return _marker_poses.get(id, Transform3D.IDENTITY)
-
-## True once this marker has been detected at least once. It may be stale by now.
-func has_marker(id: int) -> bool:
-	return _marker_poses.has(id)
-
-## Milliseconds since this marker was last detected; INF if never. INF compares correctly against
-## any max_age below, so a never-seen id is simply never fresh.
-func marker_age_ms(id: int) -> float:
-	if not _marker_last_seen.has(id):
-		return INF
-	return (Time.get_ticks_usec() - _marker_last_seen[id]) / 1000.0
-
-## True only if EVERY id is fresh -- a pose averaged over several markers is only as good as its
-## weakest one. Defaults to the patch nodes' own grace period, so "the debug box is on screen" and
-## "the consumer is tracking" stay the same statement.
-func markers_fresh(ids: Array, max_age_ms := PATCH_LOST_TIMEOUT_MS) -> bool:
-	for id in ids:
-		if marker_age_ms(id) > max_age_ms:
-			return false
-	return true
-
-## True once every id has been seen at least once, stale or not. Use this to decide whether a
-## consumer may be shown at all; markers_fresh() decides whether to move it.
-func markers_ever_seen(ids: Array) -> bool:
-	for id in ids:
-		if not _marker_poses.has(id):
-			return false
-	return true
-
-## Centroid + mean rotation of the given markers. Unknown ids are skipped; IDENTITY if none are
-## known.
-##
-## Sum-then-normalise is the cheap quaternion mean, and for exactly two markers it is identical to
-## slerp(q0, q1, 0.5). slerp cannot generalise it: it takes only two, and chaining it is not
-## associative, so the result would depend on marker order. Each quaternion is sign-aligned against
-## the first KNOWN one, because q and -q are the same rotation and would otherwise cancel instead
-## of average.
-func get_average_marker_pose(ids: Array) -> Transform3D:
-	var centre := Vector3.ZERO
-	var acc := Quaternion(0, 0, 0, 0)
-	var ref := Quaternion.IDENTITY
-	var n := 0
-	for id in ids:
-		if not _marker_poses.has(id):
-			continue
-		var x: Transform3D = _marker_poses[id]
-		var q := x.basis.get_rotation_quaternion()
-		# Counting KNOWN ids rather than using the loop index is what makes skipping safe: the
-		# reference is the first quaternion actually accumulated, not the first id asked for.
-		if n == 0:
-			ref = q
-		elif ref.dot(q) < 0.0:
-			q = -q
-		centre += x.origin
-		acc = Quaternion(acc.x + q.x, acc.y + q.y, acc.z + q.z, acc.w + q.w)
-		n += 1
-	if n == 0:
-		return Transform3D.IDENTITY
-	return Transform3D(Basis(acc.normalized()), centre / float(n))
-
-## The live debug patch node for an id, or null while the marker is undetected. Read poses through
-## get_marker_pose() -- this exists only for code that wants to touch the rendered box itself
-## (hiding it, recolouring it), and must be re-fetched every use since the node is freed on loss.
-func get_marker_node(id: int) -> Node3D:
-	return marker_nodes.get(id)
-
-# Single source of truth for a marker id's physical size: table entry if present and set,
-# aruco_patch_size otherwise. The bounds check doubles as the guard for arrays the inspector
-# resized to fewer/more than 10 elements.
-func _marker_size_for(id: int) -> float:
-	if id >= 0 and id < aruco_patch_sizes.size():
-		var s: float = aruco_patch_sizes[id]
-		if s > 0.0:
-			return s
-	return aruco_patch_size
-
-
-# Re-resolve aruco_patch_sizes/aruco_patch_size into the id -> size table the C++ side gets, and put
-# the same numbers on the live patch meshes. Both consumers of a marker's size are refreshed here,
-# so they can never drift apart.
-# CALLER CONTRACT: main thread, and only while _detect_task_id == -1. _detect_frame reads
-# _marker_size_table from a worker thread without a lock, so this is the one point in the frame at
-# which rewriting it is safe. Cheap enough to run per dispatch (~12x/s): ten dictionary writes plus
-# one scale compare per live patch.
-func _sync_marker_sizes() -> void:
-	for id in aruco_patch_sizes.size():
-		_marker_size_table[id] = _marker_size_for(id)
-	# Rows the inspector shrank the array past must go, else a deleted entry would keep feeding
-	# solvePnP its old size instead of falling back to aruco_patch_size. keys() is a copy, so
-	# erasing inside the loop is safe.
-	for id in _marker_size_table.keys():
-		if id >= aruco_patch_sizes.size():
-			_marker_size_table.erase(id)
-	# Existing patches got their scale once, at creation time (_get_or_create_patch). Without this
-	# a size change would only reach the mesh after the marker had been lost for
-	# PATCH_LOST_TIMEOUT_MS and the node was rebuilt -- the box would keep its old edge length while
-	# the pose already used the new one. Compared approximately because scale components are 32-bit:
-	# an exact != against the double from _marker_size_for would fire every single time.
-	for id in marker_nodes:
-		var size := _marker_size_for(id)
-		# The one child added in _get_or_create_patch; the patch node itself must stay scale-free,
-		# it carries the baked pose.
-		var mesh_instance: MeshInstance3D = marker_nodes[id].get_child(0)
-		if not is_equal_approx(mesh_instance.scale.x, size):
-			mesh_instance.scale = Vector3(size, size, PATCH_THICKNESS)
-			if debug_prints_enabled:
-				print("[opencv_aruco] [main_3d::_sync_marker_sizes] patch resized: id=%d size=%.3f" % [id, size])
-
-#######################################################################################################
 
 func _ready() -> void:
-	# The property setter already pushed this into the extension at scene-instantiation time; repeat
-	# it here so the flag is also correct when the scene does NOT override the default (the setter
-	# never fires then) and a previous run left the static true. Still BEFORE new(): the C++
-	# constructor prints (OpenCV build info + Quest intrinsics dump).
-	OpenCVProcessor.set_debug_prints_enabled(debug_prints_enabled)
-	processor = OpenCVProcessor.new()
+	XRServer.tracker_added.connect(_on_tracker_added)
+	XRServer.tracker_removed.connect(_on_tracker_removed)
+	# Trackers published before this node entered the tree (scene reloads) never fire
+	# tracker_added again -- pick them up from the server's current registry.
+	for tracker_name in XRServer.get_trackers(XRServer.TRACKER_ANCHOR):
+		_on_tracker_added(tracker_name, XRServer.TRACKER_ANCHOR)
 
-	# Lens pose from the exported raw Camera2 values (see their declarations for the why of the
-	# extra 180deg X-flip). Built once here, read by detection tasks without a lock afterwards.
-	_lens_pose = Transform3D(Basis((lens_rotation_raw * Quaternion(1, 0, 0, 0)).inverse()), lens_translation)
+	# Debug feed preview. The texture is created once the camera feed is up; the getter covers
+	# the case where that already happened before this _ready ran.
+	marker_tracking.camera_feed_started.connect(_on_camera_feed_started)
+	if marker_tracking.get_camera_texture() != null:
+		_on_camera_feed_started(marker_tracking.get_camera_texture())
 
-	# No patch nodes to find: they are created on demand as markers turn up (see
-	# _get_or_create_patch) and freed again when they stop being detected.
 
-	# Resolve the size table for the C++ side (entries are pre-resolved through _marker_size_for, so
-	# the C++ default only fires for ids >= the table length). _process refreshes it from here on.
-	_sync_marker_sizes()
+func _on_camera_feed_started(texture: CameraTexture) -> void:
+	cam_preview.texture = texture
 
-	# No worker setup needed: detection runs as one-shot WorkerThreadPool tasks, dispatched on
-	# demand once frames arrive (see _process) -- long after _ready has finished.
 
-	if OS.get_name() == "Android":
-		# Quest: request camera access; the native CameraServer surfaces feeds once granted.
-		OS.request_permission("android.permission.CAMERA")
-		OS.request_permission("horizonos.permission.HEADSET_CAMERA")
-	elif ClassDB.class_exists("CameraServerExtension"):
-		# Desktop (Windows): custom backend that registers the webcam as a feed.
-		camera_extension = ClassDB.instantiate("CameraServerExtension")  # keep reference alive
-
-	# Since Godot 4.5, monitoring_feeds must be true before feeds are enumerated.
-	CameraServer.monitoring_feeds = true
-	CameraServer.camera_feeds_updated.connect(_on_camera_feeds_updated)
-	_on_camera_feeds_updated()                          # in case a feed is already present
-
-	_connect_tcp()
-
-func _on_camera_feeds_updated() -> void:
-	if cam_texture != null:
-		return                                          # already initialised
-	var feed_count := CameraServer.get_feed_count()
-	if feed_count == 0:
+func _on_tracker_added(tracker_name: StringName, type: int) -> void:
+	if type != XRServer.TRACKER_ANCHOR:
+		return
+	var tracker := XRServer.get_tracker(tracker_name)
+	# The type/class checks are the whole "is this a marker?" filter -- by design there is no
+	# name matching here, so trackers from ANY marker backend (this addon, or the engine's own
+	# spatial entities capability) get a box.
+	if not tracker is OpenXRMarkerTracker:
+		return
+	if _anchors.has(tracker_name):
 		return
 
-	# log every available feed so we can see which index is the (passthrough) camera on Quest
-	if debug_prints_enabled:
-		for i in range(feed_count):
-			var f := CameraServer.get_feed(i)
-			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed: index=%d id=%d name=%s" % [i, f.get_id(), f.get_name()])
+	var anchor := XRAnchor3D.new()
+	# Cosmetic (remote scene tree); identity is the dict key. Tracker names contain '/', which
+	# node names cannot, hence the marker id instead.
+	anchor.name = "aruco_patch_%d" % tracker.marker_id
+	anchor.tracker = tracker_name       # also resets the anchor's pose name to "default"
+	anchor.show_when_tracked = true     # hidden while the pose is invalidated (marker lost)
 
-	# Quest exposes 3 feeds: "1 | FRONT" plus the passthrough pair "50 | BACK" / "51 | BACK".
-	# The world-facing ("BACK") cameras are the passthrough ones we want; feed 0 (FRONT) is the
-	# wrong camera. Desktop has a single feed, so it falls through to 0.
-	var feed: CameraFeed = null
-	for i in range(feed_count):
-		var f := CameraServer.get_feed(i)
-		if "BACK" in f.get_name():
-			feed = f
-			break
-	if feed == null:
-		feed = CameraServer.get_feed(0)
-
-	# Format MUST be chosen before activating, else "format index -1" and no frames.
-	var formats := feed.get_formats()
-	if debug_prints_enabled:
-		for j in range(formats.size()):
-			print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] format: index=%d value=%s" % [j, formats[j]])
-	if formats.size() > 2:
-		feed.set_format(2, {})        # feed format:10 1280x1280 YUV_420_888, feed format:2 640x480
-	elif formats.size() > 0:
-		feed.set_format(0, {})
-
-	feed.set_active(true)                               # start delivering frames
-	cam_texture = CameraTexture.new()
-	cam_texture.camera_feed_id = feed.get_id()
-	cam_texture.which_feed = CameraServer.FEED_RGBA_IMAGE
-	cam_preview.texture = cam_texture
-	if debug_prints_enabled:
-		print("[opencv_aruco] [main_3d::_on_camera_feeds_updated] feed activated: id=%d name=%s feed_count=%d" % [feed.get_id(), feed.get_name(), feed_count])
-
-####################################################################################################
-
-func _process(_delta: float) -> void:
-	_poll_tcp(_delta)
-	# Ticked here rather than in the readback branch below: the debug frame is now sent from
-	# _poll_detection_task, which the early returns further down never reach.
-	_tcp_send_timer += _delta
-
-	# (a) Sample the head pose EVERY render frame, before any early return below: _head_pose_at
-	# interpolates between the two nearest samples, so its accuracy is bounded by the sampling
-	# period. Recording only on detection frames would coarsen the history from ~14ms to ~80ms and
-	# put most of the capture-latency compensation back as error.
-	var now_usec := Time.get_ticks_usec()
-	_xr_cam_pose_history.append([now_usec, xr_camera.global_transform])
-	while _xr_cam_pose_history.size() > 1 and _xr_cam_pose_history[0][0] < now_usec - 500_000:
-		_xr_cam_pose_history.pop_front()
-
-	# (b) Collect the latest finished detection and bake it into the scene (main thread ->
-	# scene-tree writes are safe here).
-	_poll_detection_task()
-
-	if cam_texture == null:
-		return
-
-	# (c) Hand the newest camera frame to a detection task. get_image() (the GPU->CPU readback) and
-	# the head-pose lookup must happen on the main thread; the task only does the OpenCV work.
-	#
-	# Readback ONLY when no detection is running. Detection costs ~80ms while _process runs at the
-	# render rate (~72fps on Quest), so an unconditional get_image() paid the full readback ~6x per
-	# detection and threw all but the last one away. The readback is a GPU->CPU stall on the main
-	# thread, i.e. render-frame time burned for nothing. Skipping it while a task runs also means
-	# the frame we DO read back is the freshest one at the instant detection starts, which shortens
-	# the pose-history lookback. This is also why this branch needs no pending-frame slot: frames
-	# are pulled here, so declining to pull IS the frame drop.
-	if _detect_task_id != -1:
-		return
-
-	# Past that guard nothing can be reading _marker_size_table on a worker thread, which makes this
-	# the only safe place to rewrite it -- so this is where an inspector edit to aruco_patch_size(s)
-	# on a RUNNING remote deploy reaches both solvePnP and the rendered boxes. See _sync_marker_sizes.
-	_sync_marker_sizes()
-
-	var readback_t0 := Time.get_ticks_usec()
-	var img := cam_texture.get_image()
-	if img == null:
-		return
-	# format lookup table https://docs.godotengine.org/en/stable/classes/class_image.html#enum-image-format
-	if debug_prints_enabled:
-		print("[opencv_aruco] [main_3d::_process] readback_ms=%.2f image_format=%d" % [(Time.get_ticks_usec() - readback_t0) / 1000.0, img.get_format()])
-
-	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~CAMERA_LATENCY_MS old
-	# (passthrough pipeline), so look that far back in the history filled in (a). The pose travels
-	# with the frame and the C++ side applies it together with the lens pose, so the markers come
-	# back in world space.
-	var capture_usec := now_usec - int(CAMERA_LATENCY_MS * 1000.0)
-	_start_detection_task(img, _head_pose_at(capture_usec))
-
-# Main thread only. If the in-flight task has finished: clean it up and apply its result.
-func _poll_detection_task() -> void:
-	if _detect_task_id == -1 or not WorkerThreadPool.is_task_completed(_detect_task_id):
-		return
-	# Mandatory cleanup of every finished task; returns immediately here (the task is done) and
-	# doubles as the memory barrier that makes the task's _result_markers write visible to us.
-	WorkerThreadPool.wait_for_task_completion(_detect_task_id)
-	_detect_task_id = -1
-	_apply_detection_result()
-	# Only now do the frame and its corners both exist, so this is the earliest point at which the
-	# overlay can be streamed as one consistent pair.
-	_stream_detected_frame()
-
-func _start_detection_task(img: Image, cam_xform: Transform3D) -> void:
-	# Held for the debug streamer: _poll_detection_task sends THIS frame once the task below has
-	# produced the corners that belong to it.
-	_stream_img = img
-	_detect_task_id = WorkerThreadPool.add_task(_detect_frame.bind(img, cam_xform),
-			false, "opencv_aruco marker detection")
-
-# The patch node for a marker id, created on first sight (main thread only -- scene-tree writes).
-# The marker_nodes lookup is what guarantees one node per id: an id already in the registry gets
-# its existing node back, so no second node can ever be built for it.
-# Patches live under the (stationary) XROrigin3D, never under XRCamera3D: solvePnP gives a
-# CAMERA-relative pose, which as a camera child would be re-multiplied by the LIVE head transform
-# every frame, so a stale detection would ride the head and "swim" when you move. Anchored in
-# world space instead, the pose is baked once at detection time and stays on the real marker.
-func _get_or_create_patch(id: int) -> Node3D:
-	if marker_nodes.has(id):
-		return marker_nodes[id]
-	var patch := Node3D.new()
-	patch.name = "aruco_patch%d" % id      # cosmetic (remote scene tree); identity is the dict key
 	var mesh_instance := MeshInstance3D.new()
 	mesh_instance.mesh = _patch_mesh
-	# The BoxMesh is a unit cube and the baked pose is rigid (scale 1), so this local scale IS the
-	# cuboid's size in meters -- x/y from the id's real marker size, z the authored thickness.
-	var size := _marker_size_for(id)
-	mesh_instance.scale = Vector3(size, size, PATCH_THICKNESS)
-	patch.add_child(mesh_instance)
-	# Into the tree BEFORE the caller assigns global_transform (which needs a tree position).
-	xr_origin.add_child(patch)
-	marker_nodes[id] = patch
-	if debug_prints_enabled:
-		print("[opencv_aruco] [main_3d::_get_or_create_patch] patch created: id=%d size=%.3f patches=%d" % [
-				id, size, marker_nodes.size()])
-	return patch
+	# The BoxMesh is a unit cube and the tracked pose is rigid (scale 1), so this local scale
+	# IS the box's size in meters.
+	var bounds: Vector2 = tracker.bounds_size
+	mesh_instance.scale = Vector3(bounds.x, bounds.y, PATCH_THICKNESS)
+	anchor.add_child(mesh_instance)
+
+	# Under the (stationary) XROrigin3D: the anchor applies the tracker's play-space pose as its
+	# local transform, so it must be a direct child of the origin to land in the right place.
+	xr_origin.add_child(anchor)
+	_anchors[tracker_name] = anchor
 
 
-# Apply the finished detection (main thread only). The markers come back from the C++ side
-# already in WORLD space -- baked with the head pose at the frame's capture time, which
-# travelled with the frame -- so applying is a plain assignment.
-func _apply_detection_result() -> void:
-	var markers: Dictionary = _result_markers
-	var now_usec := Time.get_ticks_usec()
-	var seen_ids: Array = []
-	for id in markers:
-		# markers[id] is already WORLD space; freeze it there, so the head can move between
-		# detections without dragging the patch along.
-		_marker_poses[id] = markers[id]        # the id-keyed record the public API serves
-		_get_or_create_patch(id).global_transform = markers[id]
-		_marker_last_seen[id] = now_usec
-		seen_ids.append(id)
+func _on_tracker_removed(tracker_name: StringName, _type: int) -> void:
+	if not _anchors.has(tracker_name):
+		return
+	_anchors[tracker_name].queue_free()
+	_anchors.erase(tracker_name)
 
-	# Drop patches whose marker has been missing for longer than the grace period. Pruning runs
-	# HERE, on a fresh detection result, not on a timer: absence is only evidence that a marker is
-	# gone once a frame that could have contained it has been looked at. If the camera stalls, the
-	# patches stay put instead of evaporating on "no news".
-	# Iterating over keys() takes a copy, so erasing inside the loop is safe.
-	for id in marker_nodes.keys():
-		var unseen_usec: int = now_usec - int(_marker_last_seen.get(id, now_usec))
-		if unseen_usec <= int(PATCH_LOST_TIMEOUT_MS * 1000.0):
+
+func _process(_delta: float) -> void:
+	# Keep box sizes in sync with the trackers' bounds_size, so an inspector edit to the
+	# addon's marker size table on a RUNNING remote deploy reaches the rendered boxes too.
+	# Compared approximately because scale components are 32-bit floats.
+	for tracker_name in _anchors:
+		var tracker := XRServer.get_tracker(tracker_name) as OpenXRMarkerTracker
+		if tracker == null:
 			continue
-		marker_nodes[id].queue_free()
-		marker_nodes.erase(id)
-		# _marker_last_seen is NOT erased with the node: it is the public freshness record behind
-		# marker_age_ms(), and a consumer asking "how stale is my last good pose?" must still get an
-		# answer after the mesh is gone. Safe because this loop keys off marker_nodes.keys(), so a
-		# leftover entry cannot resurrect a patch, and _get_or_create_patch rebuilds the node
-		# cleanly if the marker comes back. Bounded at 50 entries by DICT_4X4_50, same as
-		# _marker_poses.
-		if debug_prints_enabled:
-			print("[opencv_aruco] [main_3d::_apply_detection_result] patch deleted: id=%d unseen_ms=%.0f patches=%d" % [
-					id, unseen_usec / 1000.0, marker_nodes.size()])
-
-	# After the prune, so a handler reacting to this signal sees the final scene state.
-	if not seen_ids.is_empty():
-		markers_updated.emit(seen_ids)
-
-# Runs on a WorkerThreadPool thread: ONE frame's OpenCV detection (detectMarkers + solvePnP) off
-# the main thread. Touches only `processor`, read-only config and the _result_markers slot -- never
-# the scene tree. Writing _result_markers without a lock is safe: the main thread reads the slot
-# only after wait_for_task_completion() on this task.
-func _detect_frame(img: Image, cam_xform: Transform3D) -> void:
-	# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
-	var t0 := Time.get_ticks_usec()
-	# The exported intrinsics are for the native 640x480 frame; all four components scale with
-	# the image, so image_downscale_factor is applied at use time.
-	var intrinsics := camera_intrinsics * image_downscale_factor
-	# The two transforms that hold for EVERY marker -- head pose at capture time and physical
-	# lens offset -- combined into ONE camera->world pose. The C++ side pre-multiplies it onto
-	# each solvePnP pose, so the returned Dictionary is already in WORLD space.
-	var cam_to_world := cam_xform * _lens_pose
-	# Out-parameter for the debug overlay: Dictionaries are shared references in Godot, so the C++
-	# side writes the detected pixel corners into THIS instance. Built fresh per detection (rather
-	# than clearing _result_corners) so the main thread can never see a half-filled dictionary --
-	# the slot is only re-pointed at the end, past the same barrier as _result_markers.
-	var corners: Dictionary = {}
-	var markers: Dictionary = processor.get_6dof_of_all_aruco_patches_from_godot_image(img, _marker_size_table, aruco_patch_size, image_downscale_factor, intrinsics, camera_distortion, cam_to_world, corners)
-	# Guarded inline rather than via a helper function: a helper would build this string on every
-	# detection (~12x/s on the Quest) before it could check the flag.
-	if debug_prints_enabled:
-		var detect_ms := (Time.get_ticks_usec() - t0) / 1000.0
-		var tracking_fps := 1000.0 / detect_ms if detect_ms > 0.0 else 0.0
-		print("[opencv_aruco] [main_3d::_detect_frame] detect_ms=%.1f tracking_fps=%.1f render_fps=%d markers=%d" % [
-				detect_ms, tracking_fps, Engine.get_frames_per_second(), markers.size()])
-	_result_markers = markers
-	_result_corners = corners
-
-
-# Head pose at t_usec, interpolated between the two nearest history samples (the raw history has
-# one sample per rendered frame, ~14ms at 72fps; interpolating removes that quantisation).
-# Falls back to the oldest/newest sample (or the live pose) at the edges of the history.
-func _head_pose_at(t_usec: int) -> Transform3D:
-	if _xr_cam_pose_history.is_empty():
-		return xr_camera.global_transform
-	if t_usec <= _xr_cam_pose_history[0][0]:
-		return _xr_cam_pose_history[0][1]
-	for i in range(_xr_cam_pose_history.size() - 1, -1, -1):
-		if _xr_cam_pose_history[i][0] <= t_usec:
-			if i == _xr_cam_pose_history.size() - 1:
-				return _xr_cam_pose_history[i][1]
-			var t0: int = _xr_cam_pose_history[i][0]
-			var t1: int = _xr_cam_pose_history[i + 1][0]
-			var w := clampf(float(t_usec - t0) / float(t1 - t0), 0.0, 1.0)
-			var p0: Transform3D = _xr_cam_pose_history[i][1]
-			var p1: Transform3D = _xr_cam_pose_history[i + 1][1]
-			return p0.interpolate_with(p1, w)
-	return _xr_cam_pose_history[0][1]
-
-
-
-func _exit_tree() -> void:
-	# A detection task may still be running on the pool; block until it is done so its bound
-	# callable (which captures self) doesn't outlive the scene. Costs at most one detection (~80ms).
-	if _detect_task_id != -1:
-		WorkerThreadPool.wait_for_task_completion(_detect_task_id)
-		_detect_task_id = -1
-
-# Send the last detected frame plus its corners, at most every TCP_SEND_INTERVAL. Called from
-# _poll_detection_task, i.e. once per finished detection (~12/s on Quest) rather than once per
-# render frame -- the interval only throttles further, it can no longer force a send.
-func _stream_detected_frame() -> void:
-	if _stream_img == null:
-		return
-	if _tcp_send_timer < TCP_SEND_INTERVAL:
-		return
-	_tcp_send_timer = 0.0
-	if stream_peer != null and stream_peer.get_status() == StreamPeerTCP.STATUS_CONNECTED:
-		_send_frame_tcp(_stream_img, _result_corners)
-
-# Wire format, big-endian throughout (stream_peer.big_endian), consumed by tools/tcp_receiver.py:
-#   header:  width u32, height u32, image_format u32, payload_size u32      (16 bytes)
-#   payload: payload_size raw Image bytes
-#   markers: marker_count u32, then per marker id u32 + 8 f32               (36 bytes each)
-#            = the 4 corners as x0,y0,x1,y1,x2,y2,x3,y3 in the payload's own pixel space.
-# The marker block is APPENDED after the image so the original 16-byte header stayed as it was.
-# Corner count per marker is fixed at 4 (guaranteed by the C++ side), hence no per-marker length.
-func _send_frame_tcp(img: Image, corners: Dictionary) -> void:
-	if stream_peer == null:
-		return
-
-	stream_peer.poll()
-
-	if stream_peer.get_status() != StreamPeerTCP.STATUS_CONNECTED:
-		return
-
-	var bytes: PackedByteArray = img.get_data()
-
-	stream_peer.put_u32(img.get_width())
-	stream_peer.put_u32(img.get_height())
-	stream_peer.put_u32(img.get_format())
-	stream_peer.put_u32(bytes.size())
-
-	var err := stream_peer.put_data(bytes)
-	if err != OK:
-		# Bail out before the marker block: the receiver is reading a fixed number of bytes per
-		# frame, so appending to a truncated payload would desync every following frame too.
-		push_error("[opencv_aruco] [main_3d::_send_frame_tcp] put_data failed: err=%d" % err)
-		return
-
-	stream_peer.put_u32(corners.size())
-	for id in corners:
-		stream_peer.put_u32(id)
-		var pts: PackedVector2Array = corners[id]
-		for p in pts:
-			stream_peer.put_float(p.x)
-			stream_peer.put_float(p.y)
-
-func _connect_tcp() -> void:
-	stream_peer = StreamPeerTCP.new()
-	stream_peer.big_endian = true
-
-	var err := stream_peer.connect_to_host(TCP_HOST, TCP_PORT)
-	if debug_prints_enabled:
-		print("[opencv_aruco] [main_3d::_connect_tcp] connect_to_host: err=%d" % err)
-
-
-func _poll_tcp(delta: float) -> void:
-	if stream_peer == null:
-		_connect_tcp()
-		return
-
-	stream_peer.poll()
-
-	var status := stream_peer.get_status()
-
-	if status != _last_tcp_status:
-		if debug_prints_enabled:
-			print("[opencv_aruco] [main_3d::_poll_tcp] status changed: from=%d to=%d" % [_last_tcp_status, status])
-		_last_tcp_status = status
-
-	if status == StreamPeerTCP.STATUS_CONNECTED:
-		_tcp_reconnect_timer = 0.0
-		return
-
-	if status == StreamPeerTCP.STATUS_CONNECTING:
-		return
-
-	if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
-		_tcp_reconnect_timer += delta
-		if _tcp_reconnect_timer >= 1.0:
-			_tcp_reconnect_timer = 0.0
-			if debug_prints_enabled:
-				print("[opencv_aruco] [main_3d::_poll_tcp] reconnecting")
-			_connect_tcp()
-#command to stop (once adb is added to PATH)
-# adb shell am force-stop de.unigreifswald.opencvaruco
+		var mesh_instance: MeshInstance3D = _anchors[tracker_name].get_child(0)
+		var bounds: Vector2 = tracker.bounds_size
+		if not is_equal_approx(mesh_instance.scale.x, bounds.x):
+			mesh_instance.scale = Vector3(bounds.x, bounds.y, PATCH_THICKNESS)

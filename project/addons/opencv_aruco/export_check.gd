@@ -7,7 +7,7 @@ extends EditorExportPlugin
 # ERR_PRINTs). This guard fails the export instead.
 #
 # Android preset option -> godot-cpp arch suffix.
-# Keep in sync with res://bin/opencv_aruco.gdextension.
+# Keep in sync with res://addons/opencv_aruco/bin/opencv_aruco.gdextension.
 const ABI_ARCHS := {
 	"architectures/armeabi-v7a": "arm32",
 	"architectures/arm64-v8a": "arm64",
@@ -39,7 +39,7 @@ func _export_begin(features: PackedStringArray, is_debug: bool, path: String, _f
 		# plugin right before calling _export_begin.
 		if not bool(get_option(option)):
 			continue
-		var lib := "res://bin/android/libopencv_aruco.android.%s%s.%s.so" % [target, precision, ABI_ARCHS[option]]
+		var lib := "res://addons/opencv_aruco/bin/android/libopencv_aruco.android.%s%s.%s.so" % [target, precision, ABI_ARCHS[option]]
 		if not FileAccess.file_exists(lib):
 			missing.append(lib)
 	if missing.is_empty():

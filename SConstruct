@@ -11,6 +11,10 @@ from methods import print_error
 
 libname = "opencv_aruco"
 projectdir = "project"
+# Die gebauten Libraries gehoeren zum Addon (res://addons/opencv_aruco/bin/), damit das
+# gesamte Addon inkl. Binaries in andere Projekte kopiert werden kann. Muss zur
+# .gdextension und zum Export-Guard (export_check.gd) passen.
+bindir = "{}/addons/opencv_aruco/bin".format(projectdir)
 
 localEnv = Environment(tools=["default"], PLATFORM="")
 
@@ -134,7 +138,7 @@ if env["platform"] == "windows":
                         "--build=missing"] + settings, check=True)
     merge_conan_deps(env, conan_out)
     library = env.SharedLibrary(  # opencv_aruco.windows.<target>[.double].<arch>.dll (kein "lib")
-        "{}/bin/windows/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        "{}/windows/{}{}{}".format(bindir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
     )
 
@@ -148,7 +152,7 @@ elif env["platform"] == "linux":
                         "--build=missing"] + settings, check=True)
     merge_conan_deps(env, conan_out)
     library = env.SharedLibrary(  # libopencv_aruco.linux.<target>[.double].<arch>.so
-        "{}/bin/linux/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        "{}/linux/{}{}{}".format(bindir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
     )
 
@@ -167,7 +171,7 @@ elif env["platform"] == "android":
     # without these the .so fails to load on device with "undefined symbol ACameraManager_create".
     env.Append(LIBS=["camera2ndk", "mediandk", "android", "log"])
     library = env.SharedLibrary(  # libopencv_aruco.android.<target>[.double].<arch>.so
-        "{}/bin/android/{}{}{}".format(projectdir, libname, env["suffix"], env["SHLIBSUFFIX"]),
+        "{}/android/{}{}{}".format(bindir, libname, env["suffix"], env["SHLIBSUFFIX"]),
         source=sources,
         # Windows-Host: SHLIBPREFIX ist per Default "" -> ohne dieses "lib" hiesse die
         # Datei opencv_aruco.android...so und wuerde von der .gdextension (die den
@@ -187,7 +191,7 @@ elif env["platform"] == "macos":
     # minimales .framework; SHLIBPREFIX="" -> Binary-Name == Framework-Name (Godot-Anforderung).
     framework = "{}.macos.{}".format(libname, env["target"])
     library = env.SharedLibrary(
-        "{}/bin/macos/{}.framework/{}".format(projectdir, framework, framework),
+        "{}/macos/{}.framework/{}".format(bindir, framework, framework),
         source=sources,
         SHLIBPREFIX="",
     )

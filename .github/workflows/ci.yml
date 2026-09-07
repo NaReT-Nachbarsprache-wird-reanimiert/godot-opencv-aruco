@@ -1,5 +1,8 @@
 # For syntax, see https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
-# This workflow is automatically triggered for every push and pull request, to verify that everything still builds.
+# Runs on every push and pull request to verify that the extension still builds on every
+# platform the project actually supports (the Conan/OpenCV setup covers windows, linux,
+# macos, android -- web/ios are not configured), and that the headless drop-in test passes.
+# For the distributable addon zip (both build targets per platform), use build_addon.yml.
 
 name: Continuous Integration
 on:
@@ -13,76 +16,102 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Test a few selected combinations of parameters ("test case matrix").
-        # While it would be nice to test all needed combinations, in practice this would a waste of CI usage time.
-        # By building just with a few combinations, we only need a few runners,
-        # while still achieving adequate coverage.
-        # To make a full build with all combinations, use the make_build.yml workflow instead.
+        # One representative target per platform keeps CI fast; build_addon.yml covers the
+        # full debug+release set.
         include:
           - target: { platform: linux, arch: x86_64, os: ubuntu-22.04 }
             target-type: template_debug
-            float-precision: double
           - target: { platform: windows, arch: x86_64, os: windows-latest }
             target-type: template_release
-            float-precision: single
-          - target: { platform: macos, arch: universal, os: macos-latest }
+          - target: { platform: macos, arch: arm64, os: macos-latest }
             target-type: template_debug
-            float-precision: single
+            # The only platform whose checked-in OpenXR vendors binaries let the full
+            # project load headless -> it carries the functional test.
+            run-test: true
           - target: { platform: android, arch: arm64, os: ubuntu-22.04 }
             target-type: template_debug
-            float-precision: single
-          - target: { platform: web, arch: wasm32, os: ubuntu-22.04 }
-            target-type: template_release
-            float-precision: double
 
     runs-on: ${{ matrix.target.os }}
     steps:
-      # Clone this repository
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: true
 
-      # Lint
-      #- name: Setup clang-format
-      #  shell: bash
-      #  run: |
-      #    python -m pip install clang-format
-      #- name: Run clang-format
-      #  shell: bash
-      #  run: |
-      #    clang-format src/** --dry-run --Werror
-
-      # Add linux x86_32 toolchain
-      - name: Install multilib support
-        if: ${{ matrix.target.platform == 'linux' && matrix.target.arch == 'x86_32' }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
-
-      # Setup dependencies
+      # Python + SCons; for android also NDK r23c (= 23.2.8568313), linked into the SDK so
+      # $ANDROID_HOME/ndk/23.2.8568313 exists (what profiles/android-arm64 expects).
       - name: Setup godot-cpp
         uses: ./godot-cpp/.github/actions/setup-godot-cpp
         with:
           platform: ${{ matrix.target.platform }}
-          em-version: 3.1.62
+          windows-compiler: msvc
 
-      # Build GDExtension (with caches)
+      # SConstruct would bootstrap Conan itself, but installing it explicitly puts `conan`
+      # on PATH for the cache-shrink step below.
+      - name: Install Conan
+        shell: bash
+        run: python -m pip install "conan>=2.0"
+
+      # OpenCV is compiled from source on a cold cache (~15-30 min); warm runs are fast.
+      - name: Restore Conan cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan2-${{ matrix.target.platform }}-${{ matrix.target.arch }}-${{ hashFiles('conanfile.py', 'profiles/**') }}
+          restore-keys: |
+            conan2-${{ matrix.target.platform }}-${{ matrix.target.arch }}-
 
       - name: Restore .scons_cache
         uses: ./godot-cpp/.github/actions/godot-cache-restore
         with:
           scons-cache: ${{ github.workspace }}/.scons-cache/
-          cache-name: ${{ matrix.target.platform }}_${{ matrix.target.arch }}_${{ matrix.float-precision }}_${{ matrix.target-type }}
+          cache-name: ${{ matrix.target.platform }}_${{ matrix.target.arch }}_${{ matrix.target-type }}
 
-      - name: Build GDExtension Debug Build
-        shell: sh
+      - name: Build GDExtension
+        shell: bash
         env:
           SCONS_CACHE: ${{ github.workspace }}/.scons-cache/
         run: |
-          scons target=${{ matrix.target-type }} platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }} precision=${{ matrix.float-precision }}
+          scons target=${{ matrix.target-type }} platform=${{ matrix.target.platform }} arch=${{ matrix.target.arch }}
+
+      # Drop Conan's source/build trees before the post-job cache save: only the built
+      # packages are worth caching.
+      - name: Shrink Conan cache
+        shell: bash
+        run: conan cache clean "*" --source --build --temp || true
 
       - name: Save .scons_cache
         uses: ./godot-cpp/.github/actions/godot-cache-save
         with:
           scons-cache: ${{ github.workspace }}/.scons-cache/
-          cache-name: ${{ matrix.target.platform }}_${{ matrix.target.arch }}_${{ matrix.float-precision }}_${{ matrix.target-type }}
+          cache-name: ${{ matrix.target.platform }}_${{ matrix.target.arch }}_${{ matrix.target-type }}
+
+      # Quest is THE deployment target -- verify the .so beyond "the link succeeded":
+      # right architecture, exported entry symbol, and the Camera2 NDK libs linked
+      # (without camera2ndk/mediandk the lib fails to load ON DEVICE only).
+      - name: Android - verify .so
+        if: ${{ matrix.target.platform == 'android' }}
+        shell: bash
+        run: |
+          so="project/addons/opencv_aruco/bin/android/libopencv_aruco.android.${{ matrix.target-type }}.arm64.so"
+          test -f "$so" || { echo "::error::$so missing"; exit 1; }
+          file "$so" | grep -q "aarch64" || { echo "::error::$so is not aarch64"; exit 1; }
+          nm -D "$so" | grep -q opencv_aruco_library_init || { echo "::error::entry symbol missing"; exit 1; }
+          readelf -d "$so" | grep -q "libcamera2ndk" || { echo "::error::libcamera2ndk not linked"; exit 1; }
+          readelf -d "$so" | grep -q "libmediandk" || { echo "::error::libmediandk not linked"; exit 1; }
+          echo "$so OK ($(du -h "$so" | cut -f1))"
+
+      # Functional gate: the drop-in contract test against the build made above
+      # (see project/tests/drop_in_test.gd; exit code 0 = passed).
+      - name: Run headless drop-in test
+        if: ${{ matrix.run-test }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          curl -sSL -o godot.zip https://github.com/godotengine/godot/releases/download/4.7.1-stable/Godot_v4.7.1-stable_macos.universal.zip
+          unzip -q godot.zip
+          GODOT="./Godot.app/Contents/MacOS/Godot"
+          # The headless editor import completes its work but can crash during teardown on
+          # macOS -- tolerate its exit code; the test run below is the actual gate.
+          "$GODOT" --headless --path project --import || echo "import exited nonzero (teardown crash tolerated)"
+          "$GODOT" --headless --path project res://tests/drop_in_test.tscn
