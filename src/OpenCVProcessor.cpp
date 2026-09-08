@@ -49,15 +49,18 @@ OpenCVProcessor::OpenCVProcessor() {
 
     aruco_nano::DetectorParameters params;
     
-    //EXPERIMENT, NOT part of PR #4: ArucoNano in place of cv::aruco::ArucoDetector. Same
-    //detectMarkers signature, but its own "visited aware" contour tracer plus direct sub-pixel
-    //sampling -- there is no cornerRefinementMethod any more, refinement is built in rather than
-    //an opt-in stage, so the old CORNER_REFINE_SUBPIX line has no equivalent here.
+    //ArucoNano rather than cv::aruco::ArucoDetector, and this is now THE detector -- it started
+    //as an experiment and stayed because the speedup was confirmed on the Quest, where detection
+    //dominates the frame. Same detectMarkers signature, but its own "visited aware" contour
+    //tracer plus direct sub-pixel sampling -- there is no cornerRefinementMethod any more,
+    //refinement is built in rather than an opt-in stage, so the old CORNER_REFINE_SUBPIX line has
+    //no equivalent here.
     //
-    //Deliberately kept on DICT_4X4_50: measuring exactly that combination is the point. Note
-    //ArucoNano defaults errorCorrectionRate to 0 (OpenCV uses 0.6, which its author considers a
-    //false-positive hazard) while 4X4_50 has a minimum Hamming distance of only 4 -- no margin
-    //for two flipped bits. If detection turns out flaky, params.errorCorrectionRate is the knob.
+    //DICT_4X4_50, unchanged -- it is what the addon documents and what the markers are printed
+    //in. Note ArucoNano defaults errorCorrectionRate to 0 (OpenCV uses 0.6, which its author
+    //considers a false-positive hazard) while 4X4_50 has a minimum Hamming distance of only 4 --
+    //no margin for two flipped bits. If detection turns out flaky, params.errorCorrectionRate is
+    //the knob, and the trade it makes is misdetections against dropped frames.
     //
     //The VECTOR constructor is REQUIRED: the single-dictionary overload does
     //_params.dicts.push_back(dict) ON TOP of the default {ARUCO_MIP_36h12}, which would leave us
