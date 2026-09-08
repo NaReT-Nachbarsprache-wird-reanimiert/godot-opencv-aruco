@@ -1,5 +1,6 @@
 #include "OpenCVProcessor.h" //include custom header file
-#include <godot_cpp/variant/utility_functions.hpp> 
+#include "aruco_nano.h" //header-only ArucoNano detector; see the forward decl in OpenCVProcessor.h
+#include <godot_cpp/variant/utility_functions.hpp>
 #include <opencv2/opencv.hpp> //solvepnp should be inside of calib3d module which is inside opencv
 #include <godot_cpp/classes/project_settings.hpp> //to convert path starting from res: to global path
 #include <algorithm> //std::clamp for the downscale parameter
@@ -46,12 +47,23 @@ OpenCVProcessor::OpenCVProcessor() {
 
     ACV_DBG("opencv build information:\n", String(cv::getBuildInformation().c_str())); // Full build configuration.
 
-    cv::aruco::DetectorParameters params;
+    aruco_nano::DetectorParameters params;
     
-    //NONE is cheapest; CONTOUR is a cheap middle ground; SUBPIX is the most accurate but iterative (slow on Quest).
-    params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-    detector = cv::aruco::ArucoDetector(
-        cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50),
+    //EXPERIMENT, NOT part of PR #4: ArucoNano in place of cv::aruco::ArucoDetector. Same
+    //detectMarkers signature, but its own "visited aware" contour tracer plus direct sub-pixel
+    //sampling -- there is no cornerRefinementMethod any more, refinement is built in rather than
+    //an opt-in stage, so the old CORNER_REFINE_SUBPIX line has no equivalent here.
+    //
+    //Deliberately kept on DICT_4X4_50: measuring exactly that combination is the point. Note
+    //ArucoNano defaults errorCorrectionRate to 0 (OpenCV uses 0.6, which its author considers a
+    //false-positive hazard) while 4X4_50 has a minimum Hamming distance of only 4 -- no margin
+    //for two flipped bits. If detection turns out flaky, params.errorCorrectionRate is the knob.
+    //
+    //The VECTOR constructor is REQUIRED: the single-dictionary overload does
+    //_params.dicts.push_back(dict) ON TOP of the default {ARUCO_MIP_36h12}, which would leave us
+    //searching two dictionaries and identifying every candidate twice. The vector overload assigns.
+    detector = std::make_unique<aruco_nano::ArucoDetector>(
+        std::vector<cv::aruco::Dictionary>{ cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50) },
         params);
     
     init_quest_intrinsics();
@@ -213,7 +225,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_picture(const Str
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
-    detector.detectMarkers(image, corners, ids);
+    detector->detectMarkers(image, corners, ids);
 
     if (ids.empty()) {
         //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
@@ -311,7 +323,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Dic
     std::vector<int> ids;
     // Profiling: split the per-frame cost so we can see which stage dominates on the Quest.
     int64_t t_detect = cv::getTickCount();
-    detector.detectMarkers(det_frame, corners, ids);
+    detector->detectMarkers(det_frame, corners, ids);
     double detect_ms = (cv::getTickCount() - t_detect) / tick_freq * 1000.0;
     ACV_DBG("resize_ms=", resize_ms, " detect_ms=", detect_ms);
 
@@ -485,7 +497,7 @@ Dictionary OpenCVProcessor::get_6dof_of_all_aruco_patches_from_webcam(const floa
 
     std::vector<std::vector<cv::Point2f>> corners;
     std::vector<int> ids;
-    detector.detectMarkers(frame, corners, ids);
+    detector->detectMarkers(frame, corners, ids);
 
     if (ids.empty()) {
         //kein Fehler, sondern der Normalfall sobald kein Marker im Bild ist -> nur Debug-Ausgabe
