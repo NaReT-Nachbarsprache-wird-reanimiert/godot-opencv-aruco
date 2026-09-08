@@ -85,32 +85,61 @@ signal camera_feed_started(texture: CameraTexture)
 @export var tcp_stream_enabled := false
 
 # --- Camera calibration (left Quest passthrough camera "50", native 640x480 frame) ----------
-# Exported so they can be tuned in the inspector instead of hunting through code. Read-only
-# after _ready: detection tasks read them without a lock (same pattern as _marker_size_table),
-# so treat inspector edits as pre-run configuration, not live tuning.
-# Intrinsics (fx, fy, cx, cy) in pixels for the NATIVE 640x480 frame. _detect_frame scales all
-# four with the downscale factor at use time -- never bake that factor into these values.
+# Exported so they can be tuned in the inspector instead of hunting through code. When NOT
+# running on Android they are rewritten whenever the camera frame size changes
+# (_approximate_desktop_intrinsics, at the same point in the frame as _sync_marker_sizes);
+# otherwise read-only: detection tasks read them without a lock (same pattern as
+# _marker_size_table), so treat inspector edits as pre-run configuration, not live tuning.
+# Intrinsics (fx, fy, cx, cy) in pixels for the NATIVE frame (640x480 on the Quest).
+# _detect_frame scales all four with the downscale factor at use time -- never bake that factor
+# into these values.
 @export var camera_intrinsics := Vector4(435.37335635, 435.96983202, 320.84589009, 241.55014114)
 # OpenCV distCoeffs (k1, k2, p1, p2, k3) for the Quest passthrough lens; an EMPTY array means
 # "no distortion".
 @export var camera_distortion: PackedFloat64Array = [-0.00484306, 0.14036606, 0.00044449, -0.00108918, -0.29608385]
+# Horizontal FOV assumed by the desktop pinhole guess (see _approximate_desktop_intrinsics).
+# 65deg is the middle of the usual laptop-webcam range. Hardcoded rather than exported on
+# purpose: it is the single number in a deliberately rough fallback, and a knob here would
+# invite tuning it by eye instead of running tools/cameraCalibration.py.
+const DESKTOP_ASSUMED_HFOV_DEG := 65.0
 # Detection resolution knob: 1.0 = native frame, 0.5 = half width AND half height -> markedly
 # cheaper detection, at the price of small or distant markers dropping below the resolution the
 # detector needs. _detect_frame hands it to the C++ side AND scales the intrinsics above by the
 # same factor; the two must always move together, which is why the factor belongs here and is
 # never baked into camera_intrinsics.
 @export_range(0.1, 1.0, 0.05) var image_downscale_factor := 1.0
-# Physical passthrough-camera pose relative to the gyro/IMU reference, RAW from the Quest's
-# ACAMERA_LENS_POSE_ROTATION / _TRANSLATION (LENS_POSE_REFERENCE == GYROSCOPE).
-# The raw quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg X-flip
-# PLUS the camera's real ~11deg pitch. The C++ marker pose already contains that same 180deg
-# flip (its negate-Y/Z change of basis), so _ready multiplies by Quaternion(1,0,0,0) (=180deg
-# about X) to cancel the flip and keep ONLY the physical mounting tilt (-> _lens_pose).
+# Physical passthrough-camera pose relative to the head/VIEW pose it gets combined with.
+# MEASURED -- these are NOT the raw Camera2 metadata; see the warning below.
+# The quaternion is ~168.8deg about X = the Android sensor->camera-optical 180deg X-flip PLUS
+# the camera's real ~11deg pitch. The C++ marker pose already contains that same 180deg flip
+# (its negate-Y/Z change of basis), so _ready multiplies by Quaternion(1,0,0,0) (=180deg about
+# X) to cancel the flip and keep ONLY the physical mounting tilt (-> _lens_pose).
 # The translation is in the sensor frame (X right, Y up, Z toward viewer), which matches Godot
-# camera axes -> raw values, no sign flips. If markers land in the wrong place, the axis
-# convention is the knob: try the conjugate quaternion / flipped translation signs.
-@export var lens_rotation_raw := Quaternion(-0.99513953924179, 0.0030371833127, -0.00251883361489, 0.0983956977725)
-@export var lens_translation := Vector3(-0.03214744105935, -0.01810946315527, -0.06306969374418)
+# camera axes -> no sign flips.
+#
+# These two are ONE calibration and must be replaced as a PAIR -- a rotation from one solve
+# beside a translation from another describes no camera that exists.
+#
+# DO NOT "fix" these by pasting in what the Quest's ACAMERA_LENS_POSE_ROTATION / _TRANSLATION
+# report at startup, however authoritative that dump looks. It is gyro-referenced
+# (LENS_POSE_REFERENCE == GYROSCOPE): the metadata describes the camera relative to the IMU,
+# while the head pose it is combined with HERE is the VIEW pose. Those two frames differ by the
+# IMU's mounting rotation, which NEITHER api exposes -- OpenXR has no IMU reference space and
+# Camera2 never mentions the view -- so the difference cannot be looked up, only measured. That
+# raw dump is what this file shipped until now, and it costs ~0.9deg: a standing offset of
+# ~15mm at 1m, ~5mm at 40cm, which no pose-path change can touch.
+#
+# Provenance: solved by tools/handeye_solve.py from ~500 captured samples of marker 0
+# (H_i * L * M_i collapsing to one world pose at 1.2mm median / 3.5mm p90), then verified in
+# CAMERA PIXELS with the reprojection overlay -- on the android-camera-plugin branch, commit
+# 81468ed. These are the values that branch RUNS with (its aruco_markers.tscn override), not
+# the different, also-measured default sitting in its OpenCVProcessor.h.
+# The lens pose describes the physical mount, so it is independent of how frames get delivered
+# (CameraX push there, CameraServer readback here) and carries over unchanged -- PROVIDED the
+# feed picked in _on_camera_feeds_updated is the same physical camera the capture ran on (the
+# left Quest passthrough camera, id "50"). Re-measure with that tool rather than editing by eye.
+@export var lens_rotation_raw := Quaternion(-0.9951163, -0.0028897487, 0.0037281485, 0.098596975)
+@export var lens_translation := Vector3(-0.03352603, -0.017866991, -0.058882877)
 
 # --- Capture-latency compensation -----------------------------------------------------------
 ## The Image get_image() returns is OLDER than "now": sensor -> ISP -> CameraServer texture
@@ -150,6 +179,13 @@ var _marker_size_table: Dictionary = {}
 # registered.
 var _camera_extension
 var _cam_texture: CameraTexture
+# Frame size camera_intrinsics has already been reconciled with; ZERO = none yet. On Android it
+# only records the size (the exported Quest calibration is the right one and is never touched);
+# off Android it is the size the pinhole guess was computed for. Compared per dispatch rather
+# than latched once, because a CameraTexture hands out a 4x4 PLACEHOLDER Image before the feed's
+# first real frame -- a guess derived from that is nonsense, and latched it would stay nonsense
+# for the whole session.
+var _intrinsics_frame_size := Vector2i.ZERO
 
 # --- Detection worker -----------------------------------------------------------------------
 # On the Quest the OpenCV detection costs ~80ms, which run synchronously would cap the whole
@@ -493,12 +529,77 @@ func _process(_delta: float) -> void:
 	if debug_prints_enabled:
 		print("[opencv_aruco] [aruco_marker_tracking::_process] readback_ms=%.2f image_format=%d" % [(Time.get_ticks_usec() - readback_t0) / 1000.0, img.get_format()])
 
+	# The exported calibration belongs to the Quest passthrough lens; on any other camera it is
+	# simply wrong, so derive a pinhole guess from the frame we just read back. Re-checked
+	# whenever the frame SIZE changes rather than once -- see _intrinsics_frame_size. HERE and
+	# not in _ready because it needs that size, and here and nowhere else in _process because
+	# past the _detect_task_id guard -- beside _sync_marker_sizes, for the same reason -- is the
+	# one point in the frame at which no worker thread can be reading the intrinsics.
+	if _intrinsics_frame_size != Vector2i(img.get_width(), img.get_height()):
+		_approximate_desktop_intrinsics(img)
+
 	# Head pose AT capture time: NOT the live pose -- the pixels in img are ~camera_latency_ms
 	# old (passthrough pipeline), so look that far back in the history filled in (a). The pose
 	# travels with the frame and the C++ side applies it together with the lens pose, so the
 	# markers come back in play space.
 	var capture_usec := now_usec - int(camera_latency_ms * 1000.0)
 	_start_detection_task(img, _head_pose_at(capture_usec))
+
+
+# Replace the Quest calibration with a pinhole guess for the camera we ACTUALLY got. Runs
+# whenever the camera frame size changes, and only off Android.
+#
+# Why it is needed: the exported fx/fy/cx/cy are the left Quest passthrough camera's at 640x480
+# and camera_distortion holds that lens's coefficients, so on a webcam all three are wrong in
+# different ways. The principal point is the worst of them -- a 1280x720 frame centres at
+# (640, 360), not (320, 241) -- and it skews the pose rather than merely scaling it; fx=435 for
+# a 640-wide frame means a 72.6deg horizontal FOV, so on a typical laptop it is off by more than
+# 2x; and distortion coefficients from a different lens ADD error instead of removing it.
+#
+# What the guess is: the textbook pinhole model -- principal point at the image centre, focal
+# length from an assumed horizontal FOV, square pixels (fx == fy), zero distortion. That is
+# enough to exercise detection, tracker publication and XRAnchor3D placement on a desktop.
+# It is NOT a calibration: orientation tolerates a wrong focal length reasonably well, RANGE
+# does not (the solved distance scales roughly linearly with the fx error). Run
+# tools/cameraCalibration.py before trusting a number that came out of the desktop path.
+#
+# CALLER CONTRACT: main thread, and only while _detect_task_id == -1 -- exactly as for
+# _sync_marker_sizes, because _detect_frame reads camera_intrinsics and camera_distortion from a
+# worker thread without a lock.
+func _approximate_desktop_intrinsics(img: Image) -> void:
+	var w := img.get_width()
+	var h := img.get_height()
+	# Recorded even when nothing below runs, so a size is reconsidered only when it changes
+	# again. On Android that reduces the whole thing to one Vector2i compare per dispatch.
+	_intrinsics_frame_size = Vector2i(w, h)
+	# OS.get_name() is the platform this build is RUNNING on: "Android" on the Quest, "Windows"
+	# on the desktop dev machine. NOTE this reads "not Android", not "not a Quest" -- on a
+	# non-Quest Android device the exported Quest calibration would be kept and be exactly as
+	# wrong as it is on a laptop. Fine here because the Quest is the only Android target.
+	if OS.get_name() == "Android":
+		# The Quest: the exported values ARE this feed's calibration. Never overwritten.
+		return
+	# A CameraTexture hands out a 4x4 placeholder Image before the feed's first real frame.
+	# Approximating from it gives fx ~ 3 px, which puts every marker about a millimetre from the
+	# camera -- inside the near plane, so the anchors are clipped and nothing renders even though
+	# detection, solvePnP and tracker publication all succeeded. Nothing this small can be a real
+	# feed; the size compare at the call site brings us back when the real frame arrives.
+	if w < 64 or h < 64:
+		return
+	var cx := w / 2.0
+	var cy := h / 2.0
+	var fx := cx / tan(deg_to_rad(DESKTOP_ASSUMED_HFOV_DEG) / 2.0)
+	camera_intrinsics = Vector4(fx, fx, cx, cy)
+	# Empty is the C++ side's "no distortion" (see the export's declaration), which is a better
+	# assumption for an unknown lens than another lens's measured coefficients.
+	camera_distortion = PackedFloat64Array()
+	# Loud on purpose, and not gated behind debug_prints_enabled: a silent approximation is how
+	# someone measures a marker at 40cm, reads 80cm, and goes looking for a bug in solvePnP.
+	push_warning(("[opencv_aruco] Not on Android: replaced the exported Quest calibration with a " +
+			"pinhole GUESS for this %dx%d frame -- fx=fy=%.1f, cx=%.1f, cy=%.1f, no distortion, " +
+			"assuming a %.0f deg horizontal FOV. Detection and tracker publication are testable " +
+			"with this; marker RANGE is not. Calibrate with tools/cameraCalibration.py for real " +
+			"numbers.") % [w, h, fx, cx, cy, DESKTOP_ASSUMED_HFOV_DEG])
 
 
 # The head pose in the XR PLAY SPACE (the space every XR tracker reports its "default" pose
@@ -649,8 +750,9 @@ func _apply_detection_result() -> void:
 func _detect_frame(img: Image, cam_xform: Transform3D) -> void:
 	# No conversion: the C++ side handles 1ch (Quest Y-plane), 3ch (RGB), and 4ch (RGBA).
 	var t0 := Time.get_ticks_usec()
-	# The exported intrinsics are for the native 640x480 frame; all four components scale with
-	# the image, so image_downscale_factor is applied at use time.
+	# The intrinsics are for the native frame -- whatever get_image() returns, 640x480 on the
+	# Quest -- and all four components scale with the image, so image_downscale_factor is applied
+	# at use time.
 	var intrinsics := camera_intrinsics * image_downscale_factor
 	# The two transforms that hold for EVERY marker -- head pose at capture time and physical
 	# lens offset -- combined into ONE camera->play-space pose. The C++ side pre-multiplies it
