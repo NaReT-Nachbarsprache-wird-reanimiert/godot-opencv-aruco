@@ -1,0 +1,12 @@
+# Python deps for everything in tools/. Install into a venv at the PROJECT ROOT -- the scripts use
+# paths relative to it, so they are all run from there:
+#
+#   py -3 -m venv .venv
+#   ./.venv/Scripts/python.exe -m pip install -r tools/requirements.txt
+#
+# opencv-CONTRIB, not plain opencv-python: cv2.aruco lives in the contrib modules, and
+# tcp_receiver.py draws the detected markers with cv2.aruco.drawDetectedMarkers. Installing both
+# packages side by side makes them fight over the same cv2 namespace -- pick contrib only.
+opencv-contrib-python==5.0.0.93
+
+numpy==2.5.2

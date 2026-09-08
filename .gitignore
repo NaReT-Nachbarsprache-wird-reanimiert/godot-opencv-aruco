@@ -37,6 +37,11 @@ bin/windows/*
 # Python bytecode cache
 __pycache__/
 
+# Python venv for the tools/ scripts (tcp_receiver, cameraCalibration). Lives at the PROJECT
+# ROOT because the scripts use paths relative to it, so they are all run from there.
+# Recreate with: py -3 -m venv .venv && ./.venv/Scripts/python.exe -m pip install -r tools/requirements.txt
+.venv/
+
 .sconsign*.dblite
 
 # Ignore custom.py
@@ -52,6 +57,9 @@ compile_commands.json
 *.o
 *.os
 *.so
+# Windows GDExtension builds. The addon's own DLL is already covered by the
+# addons/opencv_aruco/bin/windows/* rule above; this catches strays built elsewhere.
+*.dll
 *.obj
 *.bc
 *.pyc
