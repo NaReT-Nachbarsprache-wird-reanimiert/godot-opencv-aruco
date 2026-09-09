@@ -1,4 +1,4 @@
-extends XROrigin3D
+extends Node
 
 # Minimal OpenXR startup: find the interface, initialise it, and switch the
 # viewport to XR. Works on both desktop (no headset -> flat fallback) and Quest.
@@ -15,7 +15,7 @@ func _ready() -> void:
 		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 		get_viewport().use_xr = true
 
-		OpenXRMetaEnvironmentDepthExtension.start_environment_depth()
+		#OpenXRMetaEnvironmentDepthExtension.start_environment_depth()
 		# optional: keep your own hands from occluding the patches
 		#OpenXRMetaEnvironmentDepthExtension.set_hand_removal_enabled(true)
 
