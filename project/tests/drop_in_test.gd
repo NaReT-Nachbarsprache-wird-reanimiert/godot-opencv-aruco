@@ -65,10 +65,14 @@ func _ready() -> void:
 			var amt := demo.get_node_or_null("ArucoMarkerTracking")
 			_check(amt is ArucoMarkerTracking, "scene contains an ArucoMarkerTracking with the addon script")
 			if amt is ArucoMarkerTracking:
-				_check(amt.debug_prints_enabled and amt.tcp_stream_enabled,
-						"scene overrides for debug_prints_enabled/tcp_stream_enabled applied")
-				_check(amt.marker_sizes.size() == 10 and is_equal_approx(amt.marker_sizes[0], 0.1),
+				_check(amt.debug_prints_enabled, "scene override for debug_prints_enabled applied")
+				_check(amt.marker_sizes.size() == 10 and is_equal_approx(amt.marker_sizes[0], 0.079),
 						"scene override for marker_sizes applied")
+				# The measurement rig is demo-only and attaches by signal, so its absence is silent
+				# by design -- which is exactly why the scene has to assert it is there.
+				_check(amt.get_node_or_null("TcpDebugStream") != null
+						and amt.get_node_or_null("DetectionDiagnostics") != null,
+						"demo scene carries both diagnostics nodes under the tracking node")
 			_check(demo.get_node_or_null("XROrigin3D/XRCamera3D") != null
 					and demo.get_node_or_null("CameraLayer/CameraPreview") != null,
 					"demo @onready node paths exist in the scene")
@@ -76,6 +80,36 @@ func _ready() -> void:
 			# The instantiate above pushed the scene's debug_prints_enabled=true into the C++
 			# static (property setter); reset it so the detection below logs nothing.
 			OpenCVProcessor.set_debug_prints_enabled(false)
+
+	# The addon's exports are pushed into the C++ properties in _ready, so whichever literals sit
+	# in the GDScript win for every consumer -- silently, since a wrong calibration announces
+	# nothing. The two sets are kept identical precisely so that push is a no-op, and this is the
+	# check that keeps them that way.
+	print("[drop_in_test] calibration defaults (GDScript exports == C++ defaults)")
+	var ref_proc := OpenCVProcessor.new()          # C++ defaults, never pushed to
+	var plain := ArucoMarkerTracking.new()
+	plain.enabled = false
+	add_child(plain)                               # _ready -> _push_calibration()
+	var pushed := plain.get_processor()
+	_check(pushed != null, "untouched node built its processor")
+	if pushed != null:
+		_check(pushed.camera_intrinsics.is_equal_approx(ref_proc.camera_intrinsics),
+				"camera_intrinsics default survives the push")
+		_check(Array(pushed.camera_distortion) == Array(ref_proc.camera_distortion),
+				"camera_distortion default survives the push")
+		_check(pushed.lens_rotation_raw.is_equal_approx(ref_proc.lens_rotation_raw),
+				"lens_rotation_raw default survives the push")
+		_check(pushed.lens_translation.is_equal_approx(ref_proc.lens_translation),
+				"lens_translation default survives the push")
+		_check(is_equal_approx(pushed.aruco_patch_size, ref_proc.aruco_patch_size)
+				and Array(pushed.aruco_patch_sizes) == Array(ref_proc.aruco_patch_sizes),
+				"marker size defaults survive the push")
+		_check(is_equal_approx(pushed.image_downscale_factor, ref_proc.image_downscale_factor),
+				"image_downscale_factor default survives the push")
+		_check(pushed.marker_dictionary == ref_proc.marker_dictionary,
+				"marker_dictionary default survives the push")
+	ref_proc.free()
+	plain.free()
 
 	XRServer.tracker_added.connect(_on_tracker_added)
 	XRServer.tracker_removed.connect(_on_tracker_removed)
@@ -107,13 +141,27 @@ func _ready() -> void:
 	print("[drop_in_test] OpenCV detection on the test image")
 	var img := Image.load_from_file("res://assets/img_of_marker0_dict4x4_50.png")
 	_check(img != null and not img.is_empty(), "test image loads")
-	var intrinsics := Vector4(img.get_width(), img.get_width(), img.get_width() / 2.0, img.get_height() / 2.0)
-	# Identity camera pose: returned poses are camera-space. The test only needs a stable,
-	# finite pose; metric correctness on device is the calibration exports' business.
-	var detected: Dictionary = mt.processor.get_6dof_of_all_aruco_patches_from_godot_image(
-			img, {0: MARKER_SIZE}, MARKER_SIZE, 1.0, intrinsics, PackedFloat64Array(),
-			Transform3D.IDENTITY, {})
+	# The asset is DICT_4X4_50 while the addon defaults to ARUCO_MIP_36h12, so this doubles as
+	# the test of the selectable dictionary: without the switch nothing is found at all.
+	mt.marker_dictionary = OpenCVProcessor.MARKER_DICT_4X4_50
+	# Synthetic pinhole intrinsics for this image, no distortion, no downscale -- all through
+	# the write-through setters, so this exercises those too.
+	mt.camera_intrinsics = Vector4(img.get_width(), img.get_width(),
+			img.get_width() / 2.0, img.get_height() / 2.0)
+	mt.camera_distortion = PackedFloat64Array()
+	mt.image_downscale_factor = 1.0
+	# Neutralise the lens pose so the poses come back in pure CAMERA space. detect_markers
+	# applies head_pose * lens_pose, and the raw quaternion is decoded as
+	# (raw * Quaternion(1,0,0,0)).inverse() -- Quaternion(1,0,0,0) is 180deg about X, whose
+	# square is identity, so this exact value is the one that cancels. The test only needs a
+	# stable, finite pose; metric correctness on device is the calibration's business.
+	mt.lens_rotation_raw = Quaternion(1, 0, 0, 0)
+	mt.lens_translation = Vector3.ZERO
+	var corners: Dictionary = {}
+	var detected: Dictionary = mt.get_processor().detect_markers(img, Transform3D.IDENTITY, corners)
 	_check(detected.has(0), "marker id 0 detected in the image")
+	_check(corners.has(0) and (corners[0] as PackedVector2Array).size() == 4,
+		"corners_out received 4 pixel corners for id 0")
 	if not detected.has(0):
 		_finish()
 		return

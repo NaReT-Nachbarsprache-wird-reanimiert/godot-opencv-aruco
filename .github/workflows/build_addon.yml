@@ -1,7 +1,8 @@
 # Builds the opencv_aruco GDExtension for every supported platform (template_debug AND
-# template_release each) and packs the complete addon -- addons/opencv_aruco/ including all
-# binaries -- into one distributable zip. Unzipping that file into a Godot project root
-# installs the addon.
+# template_release each) and packs a complete, WORKING install into one distributable zip:
+# addons/opencv_aruco/ with all its binaries, plus the two addons it needs to reach both
+# camera backends (GodotAndroidCamera, CameraServerExtension). Unzipping that file into a
+# Godot project root installs all three.
 #
 # Triggers: manually from the Actions tab, or by pushing a tag like v1.2.3 (which also
 # creates a GitHub release with the zip attached).
@@ -98,9 +99,15 @@ jobs:
           Remove-Item project/addons/opencv_aruco/bin/windows/* -Include *.exp,*.lib,*.pdb -Force -ErrorAction SilentlyContinue
 
       # Quest is THE deployment target -- verify the .so beyond "the link succeeded":
-      # right architecture, the GDExtension entry symbol is exported, and the Camera2 NDK
-      # libs are linked (without camera2ndk/mediandk the lib fails to load ON DEVICE with
-      # "undefined symbol ACameraManager_create" while everything looks fine at build time).
+      # right architecture, the GDExtension entry symbol is exported, and libcamera2ndk is
+      # linked (without it the lib fails to load ON DEVICE with "undefined symbol
+      # ACameraManager_create" while everything looks fine at build time).
+      #
+      # libmediandk is deliberately NOT asserted any more. It is still a DT_NEEDED entry, but
+      # only because Conan's opencv cpp_info drags it in -- the explicit -lmediandk came off
+      # our link line as a duplicate, and the built .so uses ZERO symbols from it (measured:
+      # of 307 undefined symbols exactly 7 are NDK camera symbols, all ACamera*). Asserting an
+      # unused library that arrives by accident tests the dependency graph, not this project.
       - name: Android - verify .so
         if: ${{ matrix.target.platform == 'android' }}
         shell: bash
@@ -111,7 +118,6 @@ jobs:
             file "$so" | grep -q "aarch64" || { echo "::error::$so is not aarch64"; exit 1; }
             nm -D "$so" | grep -q opencv_aruco_library_init || { echo "::error::entry symbol missing in $so"; exit 1; }
             readelf -d "$so" | grep -q "libcamera2ndk" || { echo "::error::libcamera2ndk not linked in $so"; exit 1; }
-            readelf -d "$so" | grep -q "libmediandk" || { echo "::error::libmediandk not linked in $so"; exit 1; }
             echo "$so OK ($(du -h "$so" | cut -f1))"
           done
 
@@ -158,7 +164,17 @@ jobs:
         shell: bash
         run: |
           mkdir -p staging/addons
+          # All THREE addons, because opencv_aruco alone is not a working install:
+          #   GodotAndroidCamera  -- the CameraX plugin. Without it the Quest path silently
+          #                          degrades to CameraServer readback with a latency guess
+          #                          instead of real sensor timestamps.
+          #   CameraServerExtension -- the Windows desktop webcam backend.
+          # Both are optional at RUNTIME (the addon load()s the first by path and reaches the
+          # second through ClassDB), which is exactly why a consumer would never discover they
+          # were missing -- so they ship.
           cp -a project/addons/opencv_aruco staging/addons/
+          cp -a project/addons/GodotAndroidCamera staging/addons/
+          cp -a project/addons/CameraServerExtension staging/addons/
           for d in _artifacts/bin-*; do
             p="$(basename "$d")"; p="${p#bin-}"
             mkdir -p "staging/addons/opencv_aruco/bin/$p"

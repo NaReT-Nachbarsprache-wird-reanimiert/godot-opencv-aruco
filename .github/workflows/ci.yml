@@ -88,7 +88,8 @@ jobs:
 
       # Quest is THE deployment target -- verify the .so beyond "the link succeeded":
       # right architecture, exported entry symbol, and the Camera2 NDK libs linked
-      # (without camera2ndk/mediandk the lib fails to load ON DEVICE only).
+      # (without camera2ndk the lib fails to load ON DEVICE only; libmediandk is not asserted
+      # -- see the note in build_addon.yml).
       - name: Android - verify .so
         if: ${{ matrix.target.platform == 'android' }}
         shell: bash
@@ -98,7 +99,6 @@ jobs:
           file "$so" | grep -q "aarch64" || { echo "::error::$so is not aarch64"; exit 1; }
           nm -D "$so" | grep -q opencv_aruco_library_init || { echo "::error::entry symbol missing"; exit 1; }
           readelf -d "$so" | grep -q "libcamera2ndk" || { echo "::error::libcamera2ndk not linked"; exit 1; }
-          readelf -d "$so" | grep -q "libmediandk" || { echo "::error::libmediandk not linked"; exit 1; }
           echo "$so OK ($(du -h "$so" | cut -f1))"
 
       # Functional gate: the drop-in contract test against the build made above
