@@ -32,8 +32,10 @@ import numpy as np
 from plotlib import (C_ACCENT, C_AXES, C_INK, C_MUTED, gapped, load, mark_offscale, robust_ylim,
                      sample_note, style, trace)
 
-# MUST match camera_intrinsics in src/OpenCVProcessor.h -- and, if the scene overrides that property,
-# the value in project/aruco_markers.tscn, which is what the device actually ran with.
+# MUST match camera_intrinsics in src/OpenCVProcessor.h -- and, if the scene overrides it, the value
+# on the ArucoMarkerTracking node in project/main_3d.tscn, which is what the device actually ran with.
+# The addon's GDScript export pushes its own literal into the C++ property at startup, so the export
+# default is the one that decides; the two are kept identical for exactly that reason.
 FX = 436.90348444
 FY = 436.86219469
 CX = 321.49573022

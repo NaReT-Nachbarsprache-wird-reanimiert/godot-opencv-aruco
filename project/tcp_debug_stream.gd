@@ -1,16 +1,17 @@
 # Debug frame streamer: sends the camera frame plus BOTH marker overlays to tools/tcp_receiver.py
 # over TCP (port 7007, tunnelled with `adb reverse tcp:7007 tcp:7007`).
 #
-# Split out of open_cv_processor.gd because none of it is part of marker tracking: socket lifecycle,
+# Split out of the old app script because none of it is part of marker tracking: socket lifecycle,
 # reconnect, drop accounting, the wire format and the reprojection latch are all pure diagnostics.
 # Keeping them here means the app script no longer carries ~230 lines it never reads, and deleting
 # the whole facility is deleting one node rather than untangling shared state.
 #
-# Lives as a CHILD of the OpenCVProcessor node: it needs project_marker_corners(), which is a method
-# of the C++ class, so the parent IS the processor. Its own _process drives the socket, so the host
-# does not tick it.
+# Lives as a CHILD of the addon's ArucoMarkerTracking node, which owns the OpenCVProcessor whose
+# project_marker_corners() this needs and hands it over through get_processor(). Its own _process
+# drives the socket, so the host does not tick it.
 #
-# The host's only contract is submit(), called once per finished detection.
+# NOT part of the addon and deliberately not shipped with it. The dependency runs one way: the host
+# emits detection_applied and this connects submit() to it, so the addon never names this class.
 class_name TcpDebugStream
 extends Node
 
@@ -87,26 +88,43 @@ var _tcp_send_timer := 0.0
 var _tcp_out := PackedByteArray()
 var _tcp_dropped := 0
 
-# The OpenCVProcessor this hangs under. Cached rather than looked up per frame, and used for exactly
-# one thing now: project_marker_corners().
+# The host's OpenCVProcessor. Cached rather than looked up per frame, and used for exactly one
+# thing: project_marker_corners().
 #
-# Typed to the NATIVE class (the C++ one) rather than to the host's class_name, which is what makes
-# the access checked at edit time: ArucoMarkerSource here would be a cyclic script reference, since
-# the host holds a typed reference to THIS class, but OpenCVProcessor is native and sits in no cycle.
-# The debug flag that used to be read off the host's script (and forced this to be an untyped Node)
-# now comes from the C++ static instead -- see _debug below.
+# Typed to the NATIVE class (the C++ one) rather than to the host's class_name: naming
+# ArucoMarkerTracking here would point a demo-only script at an addon class, and the addon has to
+# stay installable without these scripts. OpenCVProcessor is native and carries the method anyway,
+# so the access is still checked at edit time. The debug flag that used to be read off the host's
+# script comes from the C++ static instead -- see _debug below.
 var _processor: OpenCVProcessor
 
 
+# This node is a CHILD of the addon's ArucoMarkerTracking, and its one input arrives through that
+# node's detection_applied signal -- whose argument list is exactly submit()'s, so it connects
+# straight through. The host is reached by has_signal() rather than by a typed reference: this
+# script is demo-only and not shipped with the addon, and the addon must not depend on it either.
 func _ready() -> void:
-	_processor = get_parent() as OpenCVProcessor
+	var host := get_parent()
+	if host == null or not host.has_signal("detection_applied"):
+		push_error("[opencv_aruco] [tcp_stream::_ready] parent is not an ArucoMarkerTracking: streaming disabled")
+		return
+	host.detection_applied.connect(submit)
+
+
+# The OpenCVProcessor the host owns, resolved LAZILY rather than in _ready: Godot readies CHILDREN
+# BEFORE PARENTS, so at our _ready the host has not built its processor yet. Doubles as the null
+# gate submit() used to do inline.
+func _proc() -> OpenCVProcessor:
 	if _processor == null:
-		push_error("[opencv_aruco] [tcp_stream::_ready] parent is not an OpenCVProcessor: streaming disabled")
+		var host := get_parent()
+		if host != null and host.has_method("get_processor"):
+			_processor = host.get_processor()
+	return _processor
 
 
 # Read from the C++ static rather than from the host's mirror of it. The host's exported
 # debug_prints_enabled pushes every change into exactly this static (see its setter in
-# open_cv_processor.gd), so this is the source and not a second copy -- and reading it needs no
+# the addon's aruco_marker_tracking.gd), so this is the source and not a second copy -- and reading it needs no
 # reference to the host's script at all, which is what keeps _processor typable above.
 func _debug() -> bool:
 	return OpenCVProcessor.get_debug_prints_enabled()
@@ -117,14 +135,21 @@ func _process(delta: float) -> void:
 	_tcp_send_timer += delta
 
 
-# THE entry point. Call once per finished detection, with the frame that detection ran on, the
-# corners it found, the WORLD poses it produced and the head pose those were baked with.
+# THE entry point, connected to the host's detection_applied. Called once per finished detection,
+# with the frame that detection ran on, the corners it found, the poses it produced and the head
+# pose those were baked with.
+#
+# `poses` and `head_pose` are in the same space as each other and that is ALL that matters here --
+# play space since the addon merge, world space before it. project_marker_corners inverts exactly
+# the head_pose * lens_pose it was multiplied by, so the space cancels either way; only a MISMATCH
+# between the two arguments would break the overlay.
 #
 # The frame is passed in rather than read from a slot the host owns: the send has to happen while
 # the image is still the frame those corners belong to, and an argument makes that structural
 # instead of a comment about call order.
-func submit(img: Image, corners: Dictionary, world_poses: Dictionary, head_xform: Transform3D) -> void:
-	if img == null or _processor == null:
+func submit(img: Image, corners: Dictionary, poses: Dictionary, head_pose: Transform3D) -> void:
+	var processor := _proc()
+	if img == null or processor == null:
 		return
 	if _tcp_send_timer < TCP_SEND_INTERVAL:
 		return
@@ -144,7 +169,7 @@ func submit(img: Image, corners: Dictionary, world_poses: Dictionary, head_xform
 	# lens_pose is. Only a head pose that has CHANGED since the latch makes lens_pose stop
 	# cancelling, which is why the head has to move for this to mean anything and why the baselines
 	# travel with the frame.
-	var reproj := _processor.project_marker_corners(_prev_poses, head_xform)
+	var reproj := processor.project_marker_corners(_prev_poses, head_pose)
 	# How far the head has moved since the reference was latched -- measured against the reference
 	# that produced the reprojection, so both have to be read BEFORE the re-latch below. Zero while
 	# there is no reference yet, where the identity placeholder would otherwise report the head's
@@ -169,19 +194,19 @@ func submit(img: Image, corners: Dictionary, world_poses: Dictionary, head_xform
 	var baseline_deg := 0.0
 	var d_local := Vector3.ZERO
 	if not _prev_poses.is_empty():
-		baseline_deg = rad_to_deg(head_xform.basis.get_rotation_quaternion().angle_to(
+		baseline_deg = rad_to_deg(head_pose.basis.get_rotation_quaternion().angle_to(
 				_prev_xform.basis.get_rotation_quaternion()))
 		# The current head POSITION expressed in the latched head's coordinate system. The latched
 		# head sits at that system's origin, so this vector IS the displacement in latch-local axes.
-		d_local = _prev_xform.affine_inverse() * head_xform.origin
+		d_local = _prev_xform.affine_inverse() * head_pose.origin
 	var now_ms := Time.get_ticks_msec()
 	if _prev_poses.is_empty() or now_ms - _prev_ms >= REPROJ_BASELINE_MS:
-		_prev_poses = world_poses.duplicate()
-		_prev_xform = head_xform
+		_prev_poses = poses.duplicate()
+		_prev_xform = head_pose
 		_prev_ms = now_ms
-	# world_poses, NOT _prev_poses: the recording wants this frame's estimate, while the latch
+	# poses, NOT _prev_poses: the recording wants this frame's estimate, while the latch
 	# above is the deliberately STALE reference the reprojection overlay needs.
-	_send_frame(img, corners, reproj, baseline_deg, d_local, world_poses)
+	_send_frame(img, corners, reproj, baseline_deg, d_local, poses)
 
 
 # Buffers one frame and pushes what fits right now. Never blocks; drops the frame outright while the
@@ -301,6 +326,11 @@ func _put_marker_block(buf: StreamPeerBuffer, markers: Dictionary) -> void:
 # ~2.2deg median / 5.2deg p90 regardless of how good the calibration is (see the note at
 # lens_rotation_raw in OpenCVProcessor.h). That is the noise floor these columns sit on -- a wobble
 # of a couple of degrees is the marker being small and flat, not the calibration being wrong.
+# NOTE the name is the WIRE FORMAT's, kept because tools/tcp_receiver.py and the CSV columns it
+# writes are named after it. Since the addon merge the poses in it are PLAY space, not world space:
+# identical while the XROrigin3D sits at identity and nothing has recentered, which is every setup
+# this has ever been used in, but a recording made after locomotion is in a different frame than an
+# older one. Compare recordings from the same session.
 func _put_world_block(buf: StreamPeerBuffer, world_poses: Dictionary) -> void:
 	if not record_global_marker_pos:
 		# Eight bytes even when idle, because the receiver reads a FIXED structure per frame -- an

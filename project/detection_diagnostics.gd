@@ -2,27 +2,25 @@
 # readout, and the OpenXR timing validation. None of it is part of marker tracking, and nothing on
 # the live path ever reads any of it back.
 #
-# Split out of open_cv_processor.gd for the reason TcpDebugStream was: these are things you switch
+# Split out of the old app script for the reason TcpDebugStream was: these are things you switch
 # on to MEASURE something, and they carried ~310 lines of state, file handling and statistics
 # through a script whose actual job is the detection loop. Removing the whole facility is now
 # deleting one node instead of untangling a dozen member variables from _process and
 # _apply_detection_result.
 #
-# Lives as a CHILD of the OpenCVProcessor node: the hand-eye capture calls get_lens_pose(), a method
-# of the C++ class, so the parent IS the processor -- exactly the arrangement TcpDebugStream needs
-# for project_marker_corners().
+# Lives as a CHILD of the addon's ArucoMarkerTracking node, which owns the OpenCVProcessor the
+# hand-eye capture needs get_lens_pose() from and hands it over through get_processor().
 #
-# Three entry points, and they are deliberately three rather than one:
-#   submit(head, markers)                        once per finished detection -- hand-eye + drift
-#   sample(pdt, now, offset, ..., delta)         once per rendered frame     -- pdt sync + locate check
-#   configure(locator, api, to_world, cam, org)  once, from _setup_xr_locator
+# NOT part of the addon, and deliberately not shipped with it: this is a measurement rig for the
+# provider repo's own demo. The dependency runs one way only -- everything arrives through three of
+# the host's signals, so the addon never names this class and parses fine without it:
+#   detection_applied -> submit(head, markers)   once per finished detection -- hand-eye + drift
+#   frame_sampled     -> sample(pdt, now, ...)   once per rendered frame     -- pdt sync + locate check
+#   xr_locator_ready  -> configure(locator, ...) once, when the host finds OpenXR
 # Everything sample() needs is state the HOST owns -- above all the clock offset, which the host
 # resamples (_resample_clock_offsets) -- so it is handed over per frame rather than read back out of
 # the parent. A second copy of that offset here could drift from the one the pose lookup uses, and
 # the whole point of the pdt check is to police exactly that kind of divergence.
-# The same handover rule now covers the host's XRCamera3D/XROrigin3D: they arrive as configure()
-# arguments rather than being read off the parent, which is what lets _processor be typed to the
-# NATIVE OpenCVProcessor (see its declaration) instead of to an untyped Node.
 #
 # The log lines keep their EVENT names ("marker drift", "openxr pdt sync", "openxr locate check",
 # "openxr locate raw", "handeye samples"); only the function tag changes to [diag::...], the same way
@@ -30,29 +28,56 @@
 class_name DetectionDiagnostics
 extends Node
 
-# The OpenCVProcessor this hangs under, typed to the NATIVE class (the C++ one from the extension),
-# not to the host's GDScript class_name. That distinction is the whole trick: ArucoMarkerSource here
-# would be a cyclic script reference, because the host holds a typed reference to THIS class -- but
-# OpenCVProcessor is native, sits in no cycle, and carries the only two methods this node calls
-# anyway (get_lens_pose here, project_marker_corners in the streamer). So the access is checked at
-# edit time instead of costing an unsafe-access warning per use.
-# What that costs is that GDScript-side members of the host are no longer reachable through it -- the
-# type genuinely does not have them. There were three, and all three are now handed over instead:
-# debug_prints_enabled comes from the C++ static below, xr_camera/xr_origin arrive in configure().
-# Still get_parent(): the child relationship is not incidental, it is what makes "this node
-# instruments THAT processor" unwireable-wrong, and an @export node slot could be left empty.
+# The host's OpenCVProcessor, typed to the NATIVE class (the C++ one from the extension). That it
+# is native is what lets this reference be TYPED at all: naming the host's own class ArucoMarkerTracking
+# here would point a demo-only script at an addon class, and the addon is the thing that has to stay
+# installable on its own. OpenCVProcessor carries the only method this node calls anyway
+# (get_lens_pose; project_marker_corners in the streamer), so the access is still checked at edit
+# time instead of costing an unsafe-access warning per use.
+# What that costs is that GDScript-side members of the host are not reachable through it -- the type
+# genuinely does not have them. There were three: debug_prints_enabled comes from the C++ static
+# below, and xr_camera/xr_origin are scene wiring now (see their exports).
 var _processor: OpenCVProcessor
 
 
+# Wire up to the host: this node is a CHILD of the addon's ArucoMarkerTracking, and everything it
+# needs arrives through that node's three diagnostics signals.
+#
+# The host is reached by has_method()/has_signal() rather than by a typed ArucoMarkerTracking
+# reference on purpose. This script is NOT part of the addon -- it is demo-only and deliberately
+# not shipped -- but the addon must not depend on it either, and a typed reference in the other
+# direction would be a parse error wherever the addon is installed without these scripts. Duck
+# typing is what keeps the dependency one-way.
 func _ready() -> void:
-	_processor = get_parent() as OpenCVProcessor
+	var host := get_parent()
+	if host == null or not host.has_signal("frame_sampled"):
+		push_error("[opencv_aruco] [diag::_ready] parent is not an ArucoMarkerTracking: diagnostics disabled")
+		return
+	host.frame_sampled.connect(sample)
+	host.detection_applied.connect(_on_detection_applied)
+	host.xr_locator_ready.connect(configure)
+
+
+# The OpenCVProcessor the host owns, resolved LAZILY rather than in _ready: Godot readies CHILDREN
+# BEFORE PARENTS, so at our _ready the host has not built its processor yet and this would be null
+# forever. Every use goes through here, which doubles as the null gate.
+func _proc() -> OpenCVProcessor:
 	if _processor == null:
-		push_error("[opencv_aruco] [diag::_ready] parent is not an OpenCVProcessor: diagnostics disabled")
+		var host := get_parent()
+		if host != null and host.has_method("get_processor"):
+			_processor = host.get_processor()
+	return _processor
+
+
+# detection_applied carries the frame and its corners for the streamer's benefit; the measurement
+# side only wants the poses and the head pose they were baked with.
+func _on_detection_applied(_image: Image, _corners: Dictionary, poses: Dictionary, head_pose: Transform3D) -> void:
+	submit(head_pose, poses)
 
 
 # Single debug gate, shared with the host and the streamer. Read from the C++ static rather than
 # from the host's mirror of it: the host's exported property pushes every change into exactly this
-# static (see its setter in open_cv_processor.gd), so this is the source rather than a second copy,
+# static (see its setter in the addon's aruco_marker_tracking.gd), so this is the source rather than a second copy,
 # and reading it here needs no reference to the host script at all.
 # This node has no debug switch of its own on purpose -- the hand-eye capture below has one because
 # it WRITES something; a readout that only prints has nothing to gate beyond the prints themselves.
@@ -150,9 +175,12 @@ func _handeye_record(head: Transform3D, markers: Dictionary) -> void:
 	# independent of whatever lens pose is currently configured. That independence is the point: the
 	# samples stay valid even if the lens pose is edited between capture and solve. get_lens_pose()
 	# reads the same decoded transform the detection used, so the two cannot drift apart -- and it is
-	# a method of the PARENT, which is why this node has to be its child. Inferred rather than
-	# annotated: _processor is typed to the native OpenCVProcessor, so the return type is known here.
-	var lens_pose := _processor.get_lens_pose()
+	# a method of the processor the host owns, reached through get_processor(). Inferred rather than
+	# annotated: _proc() is typed to the native OpenCVProcessor, so the return type is known here.
+	var processor := _proc()
+	if processor == null:
+		return
+	var lens_pose := processor.get_lens_pose()
 	var inv := (head * lens_pose).affine_inverse()
 	for id in markers:
 		_handeye_file.store_line(JSON.stringify({
@@ -276,13 +304,19 @@ func submit(head: Transform3D, markers: Dictionary) -> void:
 ####################################################################################################
 # --- OpenXR timing validation ---------------------------------------------------------------------
 
-# Everything below is set once by configure(), from the host's _setup_xr_locator. Null/empty means
-# there is no OpenXR at all (desktop run without a headset), and sample() then does nothing.
+# Everything below is set once by configure(), from the host's xr_locator_ready signal. Null/empty
+# means there is no OpenXR at all (desktop run without a headset), and sample() then does nothing.
 var _locator: OpenXRHeadLocator
 var _xr_api: OpenXRAPIExtension       # for get_next_frame_time(); pdt is handed in per frame
 var _to_world: Callable               # the host's _play_space_to_world
-var _xr_camera: XRCamera3D
-var _xr_origin: XROrigin3D
+
+## Wired in the SCENE rather than handed over by the host. The host used to pass these to
+## configure(), but it is an addon node now: ArucoMarkerTracking has no scene-tree dependencies at
+## all -- no XROrigin3D, no XRCamera3D -- which is exactly what lets a consumer drop it anywhere.
+## It cannot hand over what it does not have, so the two nodes check (A) compares against are the
+## diagnostics node's own business.
+@export var xr_camera: XRCamera3D
+@export var xr_origin: XROrigin3D
 
 # How far into the past the (B) probe asks, in ms. Chosen to sit at the far end of the real
 # camera latency (sensor timestamp lags ~30-60ms here), so a runtime that only keeps a short
@@ -316,17 +350,12 @@ var _lead_print_timer := 0.0
 # only a test of the TIME argument as long as both sides convert identically. A second copy would
 # turn a conversion bug into a check that passes.
 #
-# xr_camera / xr_origin travel the same way, and for the mundane version of the same reason: they are
-# @onready members of the host's SCRIPT, so reading them back through _processor would force that
-# reference to be untyped (see its declaration). They are already resolved by the time
-# _setup_xr_locator runs, so handing them over costs two arguments and buys the typing.
-func configure(locator: OpenXRHeadLocator, xr_api: OpenXRAPIExtension, to_world: Callable,
-		xr_camera: XRCamera3D, xr_origin: XROrigin3D) -> void:
+# xr_camera / xr_origin used to arrive here too. They are scene wiring now (see their exports): the
+# host is an addon node with no scene-tree dependencies of its own, so it has neither to hand over.
+func configure(locator: OpenXRHeadLocator, xr_api: OpenXRAPIExtension, to_world: Callable) -> void:
 	_locator = locator
 	_xr_api = xr_api
 	_to_world = to_world
-	_xr_camera = xr_camera
-	_xr_origin = xr_origin
 
 
 # THE per-frame entry point, called once from the host's _process.
@@ -458,7 +487,7 @@ func _check_xr_locate(pdt: int) -> void:
 		return
 
 	# Read once, so all three probes are compared against the same reference pose.
-	var live := _xr_camera.global_transform
+	var live := xr_camera.global_transform
 	var next_time: int = _xr_api.get_next_frame_time()
 
 	var at_pdt := _locate_delta(pdt, live)
@@ -481,8 +510,8 @@ func _check_xr_locate(pdt: int) -> void:
 	if at_pdt["valid"] and in_past["valid"]:
 		print("[opencv_aruco] [diag::_check_xr_locate] openxr locate raw: ps=%v cam_local=%v cam_world=%v origin=%v ref=%v scale=%.2f ps_move_mm=%.2f" % [
 				at_pdt["ps_origin"],
-				_xr_camera.transform.origin, live.origin,
-				_xr_origin.global_transform.origin, XRServer.get_reference_frame().origin,
+				xr_camera.transform.origin, live.origin,
+				xr_origin.global_transform.origin, XRServer.get_reference_frame().origin,
 				XRServer.world_scale,
 				at_pdt["ps_origin"].distance_to(in_past["ps_origin"]) * 1000.0])
 

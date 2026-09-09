@@ -43,7 +43,10 @@ func _ready() -> void:
 		_on_camera_feed_started(marker_tracking.get_camera_texture())
 
 
-func _on_camera_feed_started(texture: CameraTexture) -> void:
+# Texture2D, not CameraTexture: the addon has two camera backends and they hand over different
+# things -- the CameraServer path a live CameraTexture, the CameraX path an ImageTexture it updates
+# per frame (and only when its camera_preview_enabled is on).
+func _on_camera_feed_started(texture: Texture2D) -> void:
 	cam_preview.texture = texture
 
 

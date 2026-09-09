@@ -21,7 +21,7 @@ bool OpenCVProcessor::debug_prints_enabled = false;
 //Das feste Praefix macht sie in logcat greifbar (adb logcat | grep opencv_aruco), wo sie sonst
 //zwischen Engine- und OpenXR-Ausgaben untergehen. __func__ statt handgeschriebenem Namen, damit
 //die Angabe beim Umbenennen nicht veraltet.
-//ACV_DBG haengt am debug_prints_enabled-Flag (aus GDScript, siehe open_cv_processor.gd); die Argumente werden
+//ACV_DBG haengt am debug_prints_enabled-Flag (aus GDScript, siehe aruco_marker_tracking.gd); die Argumente werden
 //nur ausgewertet, wenn das Flag gesetzt ist -- wichtig fuer die Ausgaben im Detektions-Pfad.
 //ACV_ERR ist NICHT abschaltbar: echte Fehler sollen auch ohne Debug-Flag im Log stehen.
 #define ACV_DBG(...) \

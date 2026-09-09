@@ -144,7 +144,8 @@ private:
     // that sits in the right place but visibly wobbles in orientation is that, and the fix is
     // temporal averaging or a multi-marker board, not another lens-pose hunt.
     // RECONCILED in the addon merge. 81468ed put one measured pair here and a DIFFERENT measured
-    // pair in aruco_markers.tscn's override, and the override is the one that actually ran -- a
+    // pair in the scene's override (aruco_markers.tscn then, main_3d.tscn since the merge), and the
+    // override is the one that actually ran -- a
     // scene override beats a header default every time, so every number ever verified on device
     // came from the pair below, not from the pair that used to stand here
     // (-0.99520788537121, -0.00260202523029, 0.00286401182712, 0.09770512676372 /
@@ -236,8 +237,8 @@ public:
     //Gegenstueck zum Setter, und der Grund dafuer liegt auf der GDScript-Seite: die beiden
     //Diagnose-Kindknoten (detection_diagnostics.gd, tcp_debug_stream.gd) haengen ihre eigenen Prints
     //an dasselbe Flag. Frueher lasen sie es als Property vom Host-Skript zurueck, was deren Referenz
-    //auf den Host untypisiert zwang -- ArucoMarkerSource dort zu nennen waere ein zyklischer
-    //Skriptverweis, weil der Host seinerseits DetectionDiagnostics/TcpDebugStream typisiert haelt.
+    //auf den Host untypisiert zwang -- ArucoMarkerTracking dort zu nennen wuerde ein Nur-Demo-Skript
+    //an eine Addon-Klasse binden, und das Addon muss ohne diese Skripte installierbar bleiben.
     //Ueber diesen statischen Getter kommen die Kinder ganz ohne GDScript-Referenz aus, und ihre
     //Referenz auf den Host darf auf DIESE Klasse typisiert werden (nativ, also ausserhalb jedes
     //Zyklus). Immer der Wert, den der Setter zuletzt bekommen hat -- eine Quelle, kein Spiegel.
@@ -246,7 +247,7 @@ public:
     //everything the constructor used to do that prints or touches the device, deferred so the
     //debug flag above can still gate it -- the OpenCV build configuration plus, on Android, the
     //Quest passthrough cameras' Camera2 metadata. Purely diagnostic output: nothing here is
-    //required before detect_markers() works. Called from _ready in open_cv_processor.gd; idempotent.
+    //required before detect_markers() works. Called from _ready in aruco_marker_tracking.gd; idempotent.
     void dump_build_info_and_intrinsics();
 
     //THE detection entry point. Takes a frame the caller already owns (the CameraX plugin's Y-plane

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
-# Solve the camera->view transform (T_view_cam) from samples written by open_cv_processor.gd's
-# handeye_capture. Only numpy is needed -- no cv2, no scipy.
+# Solve the camera->view transform (T_view_cam) from samples written by the handeye_capture switch
+# on project/detection_diagnostics.gd. Only numpy is needed -- no cv2, no scipy.
 #
 # Why this exists: _lens_pose has to be the passthrough camera expressed in the OpenXR VIEW
 # frame, but the only value any API hands out is Camera2's ACAMERA_LENS_POSE_*, which is
@@ -365,7 +365,7 @@ def main():
     raw = quat_mul(q_l_inv, np.array([-1.0, 0.0, 0.0, 0.0]))
     if raw[3] < 0:
         raw = -raw          # same rotation, and matches the sign convention of the dumped values
-    print("\n--- paste onto the OpenCVProcessor node (project/aruco_markers.tscn, or its Inspector) ---")
+    print("\n--- paste onto the ArucoMarkerTracking node (project/main_3d.tscn, or its Inspector) ---")
     print("lens_rotation_raw = Quaternion(%.14f, %.14f, %.14f, %.14f)"
           % (raw[0], raw[1], raw[2], raw[3]))
     print("lens_translation = Vector3(%.14f, %.14f, %.14f)"
