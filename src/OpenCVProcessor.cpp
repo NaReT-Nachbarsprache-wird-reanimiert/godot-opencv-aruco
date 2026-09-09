@@ -95,6 +95,17 @@ void OpenCVProcessor::_bind_methods() {
                      String::num_int64(Variant::FLOAT) + "/" + String::num_int64(PROPERTY_HINT_RANGE) +
                              ":0.01,0.3,0.000001,or_greater,suffix:m"),
             "set_aruco_patch_sizes", "get_aruco_patch_sizes");
+
+    //Kein Range-, sondern ein ENUM-Hint: die Zeichenkette liefert die Klartextnamen im Inspector,
+    //die Konstanten darunter dieselben Werte fuer GDScript
+    //(OpenCVProcessor.MARKER_DICT_4X4_50). Reihenfolge = Enum-Reihenfolge im Header.
+    ClassDB::bind_method(D_METHOD("set_marker_dictionary", "value"), &OpenCVProcessor::set_marker_dictionary);
+    ClassDB::bind_method(D_METHOD("get_marker_dictionary"), &OpenCVProcessor::get_marker_dictionary);
+    ADD_PROPERTY(PropertyInfo(Variant::INT, "marker_dictionary", PROPERTY_HINT_ENUM,
+                     "ArUco MIP 36h12,4x4 (50 ids)"),
+            "set_marker_dictionary", "get_marker_dictionary");
+    BIND_ENUM_CONSTANT(MARKER_DICT_ARUCO_MIP_36H12);
+    BIND_ENUM_CONSTANT(MARKER_DICT_4X4_50);
 }
 
 // ================================ Kalibrierung: Zugriff + Ableitung ================================
@@ -115,6 +126,32 @@ void OpenCVProcessor::rebuild_distortion() {
     for (int j = 0; j < n; ++j) {
         distort_mat.at<float>(j) = (float)dp[j];
     }
+}
+
+void OpenCVProcessor::rebuild_detector(MarkerDictionary p_dict) {
+    //NUR vom Konstruktor (Hauptthread, noch kein Worker) und vom Detektionsthread aufrufen. Der
+    //Setter von marker_dictionary tut es absichtlich NICHT: er liefe auf dem Hauptthread, waehrend
+    //der Worker den alten Detektor gerade benutzt.
+    //
+    //Der Vektor-Konstruktor ist hier PFLICHT. Die Ein-Woerterbuch-Ueberladung macht
+    //_params.dicts.push_back(dict) ZUSAETZLICH zum Default -- mit ARUCO_MIP_36h12 suchten wir dann
+    //in {ARUCO_MIP_36h12, ARUCO_MIP_36h12} und identifizierten jeden Kandidaten doppelt. Die
+    //Vektor-Ueberladung weist stattdessen zu.
+    cv::aruco::PredefinedDictionaryType type = cv::aruco::DICT_ARUCO_MIP_36h12;
+    switch (p_dict) {
+        case MARKER_DICT_4X4_50:
+            type = cv::aruco::DICT_4X4_50;
+            break;
+        case MARKER_DICT_ARUCO_MIP_36H12:
+        default:
+            type = cv::aruco::DICT_ARUCO_MIP_36h12;
+            break;
+    }
+    detector = std::make_unique<aruco_nano::ArucoDetector>(
+        std::vector<cv::aruco::Dictionary>{ cv::aruco::getPredefinedDictionary(type) });
+    detector_dictionary = p_dict;
+    ACV_DBG("detector rebuilt: dictionary=", (int)p_dict,
+            (p_dict == MARKER_DICT_4X4_50 ? " (DICT_4X4_50)" : " (ARUCO_MIP_36h12)"));
 }
 
 void OpenCVProcessor::rebuild_lens_pose() {
@@ -154,18 +191,27 @@ float OpenCVProcessor::get_aruco_patch_size() const { return aruco_patch_size; }
 void OpenCVProcessor::set_aruco_patch_sizes(const PackedFloat64Array &p_value) { aruco_patch_sizes = p_value; }
 PackedFloat64Array OpenCVProcessor::get_aruco_patch_sizes() const { return aruco_patch_sizes; }
 
+//Bewusst OHNE rebuild_detector(): siehe die Begruendung am Member im Header. Die naechste
+//Detektion sieht die Abweichung und baut auf ihrem eigenen Thread neu.
+void OpenCVProcessor::set_marker_dictionary(MarkerDictionary p_value) { marker_dictionary = p_value; }
+OpenCVProcessor::MarkerDictionary OpenCVProcessor::get_marker_dictionary() const { return marker_dictionary; }
+
 Transform3D OpenCVProcessor::get_lens_pose() const { return lens_pose; }
 
 //Nicht-positive Eintraege zaehlen als "kein Eintrag", damit eine kaputte Tabellenzeile solvePnP nie
 //ein entartetes Quadrat unterschiebt -- und damit eine 0 im Inspector schlicht "unbelegt" heisst.
-float OpenCVProcessor::get_marker_size(int id) const {
-    if (id >= 0 && id < (int)aruco_patch_sizes.size()) {
-        const double s = aruco_patch_sizes[id];
+float OpenCVProcessor::marker_size_from(const PackedFloat64Array &table, float fallback, int id) {
+    if (id >= 0 && id < (int)table.size()) {
+        const double s = table[id];
         if (s > 0.0) {
             return (float)s;
         }
     }
-    return aruco_patch_size;
+    return fallback;
+}
+
+float OpenCVProcessor::get_marker_size(int id) const {
+    return marker_size_from(aruco_patch_sizes, aruco_patch_size, id);
 }
 
 void OpenCVProcessor::set_debug_prints_enabled(bool p_enabled) {
@@ -197,12 +243,9 @@ OpenCVProcessor::OpenCVProcessor() {
     //Cost: 6x6 bits plus the border is 8 modules across against 6, so a marker needs ~33% more
     //pixels to identify, i.e. ~25% less working distance at the same printed size.
     //
-    //The vector constructor is REQUIRED here. The single-dictionary overload does
-    //_params.dicts.push_back(dict) ON TOP of the default, which with this dictionary would
-    //leave us searching {ARUCO_MIP_36h12, ARUCO_MIP_36h12} -- every candidate identified twice.
-    //The vector overload assigns instead.
-    detector = std::make_unique<aruco_nano::ArucoDetector>(
-        std::vector<cv::aruco::Dictionary>{ cv::aruco::getPredefinedDictionary(cv::aruco::DICT_ARUCO_MIP_36h12) });
+    //Hier schon bauen, damit die erste Detektion keinen Aufbau-Hitch hat; danach ist
+    //rebuild_detector() Sache des Detektionsthreads (siehe dort).
+    rebuild_detector(marker_dictionary);
 
     //Defaults der Packed-Arrays: die haben keinen Inline-Initialisierer im Header. Godot liest die
     //Property-Defaults, indem es die Klasse einmal instanziiert -- was hier steht, ist also genau
@@ -397,6 +440,12 @@ void OpenCVProcessor::dump_quest_camera_metadata() {
 Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Transform3D &head_pose, Dictionary &corners_out) {
     Dictionary result;
 
+    // Woerterbuchwechsel einloesen, falls einer ansteht. Hier und nur hier, weil dies der einzige
+    // Thread ist, der `detector` dereferenziert -- der Setter darf ihn nicht unter uns wegziehen.
+    if (detector == nullptr || detector_dictionary != marker_dictionary) {
+        rebuild_detector(marker_dictionary);
+    }
+
     // The two transforms that hold for EVERY marker, combined once: solvePnP returns the marker
     // pose in the physical CAMERA frame, head_pose is where the head was when the shutter opened
     // (only the caller can know that), and lens_pose is the fixed camera-to-head offset. So the
@@ -442,6 +491,20 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
     const float fy = (float)K_active.y * DETECT_DOWNSCALE;
     const float cx = (float)K_active.z * DETECT_DOWNSCALE;
     const float cy = (float)K_active.w * DETECT_DOWNSCALE;
+
+    // Dieselbe Kopie-einmal-Regel wie bei K_active, aber hier ist sie nicht bloss Kosmetik gegen
+    // gemischte Kalibrierungen, sondern LEBENSDAUER. distort_mat geht per Referenz in cv::solvePnP;
+    // rebuild_distortion() weist das Member auf dem Hauptthread NEU zu (Header-Rebind plus
+    // Refcount-Drop), waehrend diese Schleife es liest. Eine cv::Mat-Kopie teilt die Pixel, haelt
+    // aber ihren eigenen Refcount, und genau das braucht der Worker. Erreichbar wurde das erst
+    // durch _approximate_desktop_intrinsics() im Addon, das camera_distortion zur Laufzeit
+    // schreibt -- vorher schrieb schlicht niemand.
+    const cv::Mat D_active = distort_mat;
+    // Und dieselbe Ueberlegung fuer die Groessentabelle: PackedFloat64Array ist copy-on-write, ein
+    // Setter-Aufruf mitten in der Solve-Schleife wuerde den Zeiger tauschen und zwei Marker
+    // DESSELBEN Frames gegen zwei verschiedene Tabellen aufloesen.
+    const PackedFloat64Array sizes_active = aruco_patch_sizes;
+    const float size_fallback_active = aruco_patch_size;
 
     cv::Mat Kamera_matrix = (cv::Mat_<float>(3, 3) <<
         fx, 0, cx,
@@ -490,9 +553,10 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
 
     double solve_ms = 0.0;                               // accumulated solvePnP time over all markers
     for (size_t i = 0; i < ids.size(); ++i) {
-        // Per-id physical size, through the SAME function the GDScript uses to scale the rendered
-        // patch -- so the pose's metric scale and the box drawn over the marker cannot disagree.
-        const float half = get_marker_size(ids[i]) / 2.0f;
+        // Per-id physical size, through the SAME rule get_marker_size() serves the GDScript with --
+        // so the pose's metric scale and the box drawn over the marker cannot disagree. Gegen die
+        // Frame-Kopie der Tabelle aufgeloest, nicht gegen das Member: siehe sizes_active oben.
+        const float half = marker_size_from(sizes_active, size_fallback_active, ids[i]) / 2.0f;
         const std::vector<cv::Point3f> obj_pts = {
             {-half,  half, 0.0f},
             { half,  half, 0.0f},
@@ -502,7 +566,7 @@ Dictionary OpenCVProcessor::detect_and_solve_all(const cv::Mat &frame, const Tra
         cv::Mat rvec, tvec;
         int64_t t_solve = cv::getTickCount();
         bool ok2 = cv::solvePnP(
-            obj_pts, corners[i], Kamera_matrix, distort_mat,
+            obj_pts, corners[i], Kamera_matrix, D_active,
             rvec, tvec,
             false,
             cv::SOLVEPNP_IPPE_SQUARE);

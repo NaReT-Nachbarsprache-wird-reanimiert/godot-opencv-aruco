@@ -27,9 +27,31 @@ namespace aruco_nano { class ArucoDetector; }
 class OpenCVProcessor : public Node {
     GDCLASS(OpenCVProcessor, Node)
 
+public:
+    //Welches vordefinierte Woerterbuch der Detektor sucht. Frueher fest einkompiliert; waehlbar,
+    //weil die beiden Zweige, die hier zusammenkommen, sich darin unterschieden und JEDE Wahl einen
+    //Satz bereits GEDRUCKTER Marker entwertet haette -- physisches Material, das keine
+    //Code-Aenderung zurueckholt. Immer nur EINES aktiv, nie beide: Ids kollidieren zwischen
+    //Woerterbuechern (Marker 3 aus 4x4_50 und Marker 3 aus 36h12 waeren derselbe Schluessel), und
+    //jedes zusaetzliche Woerterbuch kostet einen eigenen Erkennungsdurchlauf.
+    enum MarkerDictionary {
+        //Standard. 36 Bit mit Mindest-Hamming-Abstand 12 -- siehe die Herleitung im Konstruktor,
+        //warum das zu ArucoNanos errorCorrectionRate=0 passt und 4x4_50 nicht.
+        MARKER_DICT_ARUCO_MIP_36H12 = 0,
+        //16 Bit, Abstand 4. Das, was dieses Projekt bis 2026-08 benutzt hat, was
+        //project/assets/img_of_marker0_dict4x4_50.png zeigt und worauf die Marker im
+        //Nachbarprojekt gedruckt sind. Flakiger (siehe Konstruktor), aber vorhandenes Material.
+        MARKER_DICT_4X4_50 = 1,
+    };
+
 private:
-    //built once in ctor and reused; dictionary+params are baked in at construction
+    //Auf dem DETEKTIONSTHREAD gebaut, nicht im Setter von marker_dictionary -- siehe
+    //rebuild_detector(). Der Worker ist der einzige Thread, der diesen Zeiger dereferenziert.
     std::unique_ptr<aruco_nano::ArucoDetector> detector;
+    //Womit `detector` tatsaechlich gebaut wurde. Weicht es von marker_dictionary ab, baut die
+    //naechste Detektion neu; das ist die ganze Umschaltmechanik.
+    MarkerDictionary detector_dictionary = MARKER_DICT_ARUCO_MIP_36H12;
+    void rebuild_detector(MarkerDictionary p_dict);
 
     // ============================ Kalibrierung (Inspector-Properties) ============================
     // These used to be @export vars in the GDScript and were handed to the detection call as seven
@@ -121,8 +143,19 @@ private:
     // noise on a single small planar marker, and it stays no matter how good this pose is. A patch
     // that sits in the right place but visibly wobbles in orientation is that, and the fix is
     // temporal averaging or a multi-marker board, not another lens-pose hunt.
-    Quaternion lens_rotation_raw = Quaternion(-0.99520788537121, -0.00260202523029, 0.00286401182712, 0.09770512676372);
-    Vector3 lens_translation = Vector3(-0.03586537368457, -0.01756000674934, -0.06026289442816);
+    // RECONCILED in the addon merge. 81468ed put one measured pair here and a DIFFERENT measured
+    // pair in aruco_markers.tscn's override, and the override is the one that actually ran -- a
+    // scene override beats a header default every time, so every number ever verified on device
+    // came from the pair below, not from the pair that used to stand here
+    // (-0.99520788537121, -0.00260202523029, 0.00286401182712, 0.09770512676372 /
+    //  -0.03586537368457, -0.01756000674934, -0.06026289442816).
+    // Keeping the two apart was dangerous in a way that only shows up now: the addon's GDScript
+    // export pushes ITS literal into this property at startup, so whichever pair sits in the
+    // GDScript wins for every consumer, silently. Header default and export default are therefore
+    // identical from here on, and the push is a no-op for an untouched scene --
+    // project/tests/drop_in_test.gd asserts exactly that.
+    Quaternion lens_rotation_raw = Quaternion(-0.9951163, -0.0028897487, 0.0037281485, 0.098596975);
+    Vector3 lens_translation = Vector3(-0.03352603, -0.017866991, -0.058882877);
 
     // Fallback physical side length in meters for every marker id WITHOUT an aruco_patch_sizes
     // entry. Sets the pose's metric scale in solvePnP AND (through get_marker_size) the rendered
@@ -133,6 +166,14 @@ private:
     // so an untouched table behaves exactly like the single-size setup before it existed.
     PackedFloat64Array aruco_patch_sizes;
 
+    // Gewuenschtes Woerterbuch (siehe das Enum oben). Anders als die uebrigen Properties leitet der
+    // Setter NICHTS ab: er schreibt nur diesen int, und die naechste Detektion vergleicht ihn mit
+    // detector_dictionary und baut bei Bedarf neu. Das ist kein Stilbruch, sondern die einzige
+    // sichere Variante -- rebuild im Setter wuerde den unique_ptr auf dem Hauptthread zuruecksetzen,
+    // waehrend der Worker gerade detector->detectMarkers() darauf aufruft: use-after-free, nicht
+    // bloss ein zerrissener Wert.
+    MarkerDictionary marker_dictionary = MARKER_DICT_ARUCO_MIP_36H12;
+
     // Derived, never edited: rebuilt by the setters above so an inspector edit takes effect on the
     // very next frame. Deriving them once at startup was the old behaviour and meant a lens-pose
     // tweak in the remote inspector of a running deploy did nothing at all.
@@ -140,6 +181,14 @@ private:
     Transform3D lens_pose;                     // decoded from lens_rotation_raw/lens_translation
     void rebuild_distortion();
     void rebuild_lens_pose();
+
+    // Reine Funktion hinter get_marker_size(): dieselbe Regel (Tabelleneintrag wenn vorhanden und
+    // positiv, sonst der Fallback), aber auf einer uebergebenen Tabelle statt auf dem Member. Der
+    // Detektionsthread zieht sich EINE Kopie der Tabelle und loest alle Marker eines Frames dagegen
+    // auf -- sonst koennte ein Inspector-Schreibzugriff mitten in der Solve-Schleife den
+    // CoW-Zeiger tauschen und zwei Marker desselben Frames gegen zwei verschiedene Tabellen
+    // aufloesen.
+    static float marker_size_from(const PackedFloat64Array &table, float fallback, int id);
 
     //THE detect+solvePnP pipeline, and since the legacy imread/VideoCapture entry points went, the
     //ONLY one -- so the OpenCV->Godot change of basis (the most error-prone thing in this codebase)
@@ -237,4 +286,8 @@ public:
     float get_aruco_patch_size() const;
     void set_aruco_patch_sizes(const PackedFloat64Array &p_value);
     PackedFloat64Array get_aruco_patch_sizes() const;
+    void set_marker_dictionary(MarkerDictionary p_value);
+    MarkerDictionary get_marker_dictionary() const;
 };
+
+VARIANT_ENUM_CAST(OpenCVProcessor::MarkerDictionary);
