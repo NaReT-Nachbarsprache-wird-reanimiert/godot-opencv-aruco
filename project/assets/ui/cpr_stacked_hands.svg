@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240">
+  <rect x="6" y="6" width="308" height="228" rx="30" fill="#06291e" fill-opacity=".88" stroke="#61e8aa" stroke-opacity=".5" stroke-width="2"/>
+  <!-- Side view: lower heel on the chest; the second hand rests above it. -->
+  <path d="M47 204 Q157 184 273 204" fill="none" stroke="#56d99e" stroke-width="5" stroke-linecap="round"/>
+  <path d="M70 75 L105 66 L136 137 Q146 146 162 147 L245 156 Q257 158 255 169 Q254 177 241 178 L169 176 Q154 190 137 182 Q123 177 118 160 Z" fill="#219e70" stroke="#c0ffe0" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M177 29 L211 41 L183 118 Q189 126 204 130 L243 140 Q255 144 250 154 Q247 162 234 159 L188 147 Q175 150 164 144 L143 131 Q133 125 139 114 Z" fill="#73eab0" stroke="#e4fff0" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M188 132 L228 144 M181 139 L216 150 M178 159 L237 165 M176 168 L228 173" fill="none" stroke="#105c41" stroke-width="3" stroke-linecap="round"/>
+  <!-- A short contact marker distinguishes the heel from the fingertips. -->
+  <ellipse cx="149" cy="190" rx="16" ry="5" fill="#a1ffd0"/>
+</svg>
