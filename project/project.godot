@@ -80,8 +80,6 @@ META_ENVIRONMENT_DEPTH_TO_CAMERA_PROJECTION_RIGHT={
 
 openxr/enabled=true
 openxr/environment_blend_mode=2
-# LOCAL_FLOOR: Quest/OpenXR supplies the calibrated physical floor as world Y = 0. The avatar rig's
-# floor boundary (xr_startup.gd's has_floor/floor_height_world) is only meaningful in this space.
 openxr/reference_space=2
 openxr/extensions/hand_tracking=true
 shaders/enabled=true
