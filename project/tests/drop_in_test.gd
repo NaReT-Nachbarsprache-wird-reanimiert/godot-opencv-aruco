@@ -66,8 +66,18 @@ func _ready() -> void:
 			_check(amt is ArucoMarkerTracking, "scene contains an ArucoMarkerTracking with the addon script")
 			if amt is ArucoMarkerTracking:
 				_check(amt.debug_prints_enabled, "scene override for debug_prints_enabled applied")
-				_check(amt.marker_sizes.size() == 10 and is_equal_approx(amt.marker_sizes[0], 0.079),
-						"scene override for marker_sizes applied")
+				# Anchored on marker_dictionary, not on a marker size. This check exists only to
+				# prove an override ARRIVED -- instantiate() silently drops assignments to renamed
+				# or removed properties, so the outcome has to be asserted rather than the act --
+				# and for that it needs a property whose value is a DECISION, not a MEASUREMENT.
+				# marker_sizes[0] stood here and had to be edited every time someone re-measured a
+				# printed marker, which is how it came to disagree with the scene. Which dictionary
+				# the markers were PRINTED in cannot drift like that.
+				# NOTE this pins the test to a scene whose app runs 4x4_50. A demo scene on the
+				# default dictionary (36h12) cannot express the override at all -- Godot omits
+				# default values from .tscn -- so that branch needs its own value here.
+				_check(amt.marker_dictionary == OpenCVProcessor.MARKER_DICT_4X4_50,
+						"scene override for marker_dictionary applied")
 				# The measurement rig is demo-only and attaches by signal, so its absence is silent
 				# by design -- which is exactly why the scene has to assert it is there.
 				_check(amt.get_node_or_null("TcpDebugStream") != null
