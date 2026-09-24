@@ -51,21 +51,20 @@ func _ready() -> void:
 	_check(ClassDB.class_exists("OpenXRMarkerTracker"), "OpenXRMarkerTracker class exists")
 	_check(ClassDB.class_exists("OpenCVProcessor"), "OpenCVProcessor GDExtension class exists")
 
-	# Smoke check on the demo scene (_ready does not run since the instance never enters the
+	# Smoke check on the app scene (_ready does not run since the instance never enters the
 	# tree). load()/instantiate() succeed even on script parse errors, missing ext_resources
 	# and assignments to renamed properties -- the engine drops those silently -- so assert the
 	# OUTCOME: scripts actually attached, scene property overrides actually applied.
-	var demo_scene: PackedScene = load("res://main_3d.tscn")
-	_check(demo_scene != null, "demo scene resource loads")
-	if demo_scene != null:
-		var demo := demo_scene.instantiate()
-		_check(demo != null, "demo scene instantiates")
-		if demo != null:
-			_check(demo.get_script() == load("res://main_3d.gd"), "demo root has its script attached")
-			var amt := demo.get_node_or_null("ArucoMarkerTracking")
+	var app_scene: PackedScene = load("res://cpr_trainer.tscn")
+	_check(app_scene != null, "app scene resource loads")
+	if app_scene != null:
+		var app := app_scene.instantiate()
+		_check(app != null, "app scene instantiates")
+		if app != null:
+			_check(app.get_script() == load("res://cpr_trainer.gd"), "app root has its script attached")
+			var amt := app.get_node_or_null("ArucoMarkerTracking")
 			_check(amt is ArucoMarkerTracking, "scene contains an ArucoMarkerTracking with the addon script")
 			if amt is ArucoMarkerTracking:
-				_check(amt.debug_prints_enabled, "scene override for debug_prints_enabled applied")
 				# Anchored on marker_dictionary, not on a marker size. This check exists only to
 				# prove an override ARRIVED -- instantiate() silently drops assignments to renamed
 				# or removed properties, so the outcome has to be asserted rather than the act --
@@ -82,13 +81,13 @@ func _ready() -> void:
 				# by design -- which is exactly why the scene has to assert it is there.
 				_check(amt.get_node_or_null("TcpDebugStream") != null
 						and amt.get_node_or_null("DetectionDiagnostics") != null,
-						"demo scene carries both diagnostics nodes under the tracking node")
-			_check(demo.get_node_or_null("XROrigin3D/XRCamera3D") != null
-					and demo.get_node_or_null("CameraLayer/CameraPreview") != null,
-					"demo @onready node paths exist in the scene")
-			demo.free()
-			# The instantiate above pushed the scene's debug_prints_enabled=true into the C++
-			# static (property setter); reset it so the detection below logs nothing.
+						"app scene carries both diagnostics nodes under the tracking node")
+			_check(app.get_node_or_null("XROrigin3D/XRCamera3D") != null
+					and app.get_node_or_null("CameraLayer/CameraPreview") != null,
+					"root's @onready node paths exist in the scene")
+			app.free()
+			# Whatever debug_prints_enabled the scene carries, the instantiate above pushed it
+			# into the C++ static (property setter); reset it so the detection below logs nothing.
 			OpenCVProcessor.set_debug_prints_enabled(false)
 
 	# The addon's exports are pushed into the C++ properties in _ready, so whichever literals sit

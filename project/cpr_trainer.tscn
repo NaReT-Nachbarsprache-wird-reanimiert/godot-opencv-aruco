@@ -1,6 +1,6 @@
 [gd_scene format=3 uid="uid://catn06b43r1ce"]
 
-[ext_resource type="Script" uid="uid://crxyq5donm67c" path="res://main_3d.gd" id="1_wiwsh"]
+[ext_resource type="Script" uid="uid://crxyq5donm67c" path="res://cpr_trainer.gd" id="1_wiwsh"]
 [ext_resource type="Script" uid="uid://df20bwxeyvlj4" path="res://xr_startup.gd" id="2_xr"]
 [ext_resource type="Script" uid="uid://bowhoc6sk1l2c" path="res://addons/opencv_aruco/aruco_marker_tracking.gd" id="3_aruco"]
 [ext_resource type="Script" uid="uid://c0118do55uofq" path="res://tcp_debug_stream.gd" id="4_tcpds"]
@@ -22,17 +22,17 @@ albedo_color = Color(1, 0.05882353, 0.35686275, 1)
 radius = 0.02
 height = 0.04
 
-[node name="main3d" type="Node3D" unique_id=557024045]
+[node name="CPRTrainer" type="Node3D" unique_id=557024045]
 script = ExtResource("1_wiwsh")
 
 [node name="ArucoMarkerTracking" type="Node" parent="." unique_id=1286694717]
 script = ExtResource("3_aruco")
-marker_sizes = Array[float]([0.1, 0.1, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
+marker_sizes = Array[float]([0.1, 0.094, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
 marker_dictionary = 1
-debug_prints_enabled = true
 
 [node name="TcpDebugStream" type="Node" parent="ArucoMarkerTracking" unique_id=1286694718]
 script = ExtResource("4_tcpds")
+enabled = true
 
 [node name="DetectionDiagnostics" type="Node" parent="ArucoMarkerTracking" unique_id=1286694719 node_paths=PackedStringArray("xr_camera", "xr_origin")]
 script = ExtResource("5_diagn")
@@ -52,29 +52,26 @@ tracker = &"right_hand"
 
 [node name="OpenXRMetaEnvironmentDepth" type="OpenXRMetaEnvironmentDepth" parent="XROrigin3D/XRCamera3D" unique_id=1896255835]
 
-[node name="CPRFeedbackHUD" type="Node3D" parent="XROrigin3D/XRCamera3D" node_paths=PackedStringArray("zone")]
-position = Vector3(0, 0.06, -0.8)
+[node name="CPRFeedbackHUD" type="Node3D" parent="XROrigin3D/XRCamera3D" unique_id=1305597855 node_paths=PackedStringArray("zone")]
 process_priority = 30
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.06, -0.8)
 script = ExtResource("12_cpr_hud")
 zone = NodePath("../../../AvatarRig/mannequin/CPRHandZone")
 
-[node name="LoggerStatus3D" type="Label3D" parent="XROrigin3D/XRCamera3D" node_paths=PackedStringArray("avatar_rig")]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.18, -0.6)
+[node name="LoggerStatus3D" type="Label3D" parent="XROrigin3D/XRCamera3D" unique_id=1288010575 node_paths=PackedStringArray("avatar_rig")]
 process_priority = 20
-script = ExtResource("11_status")
-avatar_rig = NodePath("../../../AvatarRig")
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -0.18, -0.6)
 pixel_size = 0.0006
 billboard = 1
-shaded = false
-double_sided = true
 no_depth_test = true
 fixed_size = true
 text = "Placing avatar…"
 font_size = 64
 outline_size = 16
-horizontal_alignment = 1
+script = ExtResource("11_status")
+avatar_rig = NodePath("../../../AvatarRig")
 
-[node name="ArucoCsvLogger" type="Node" parent="." node_paths=PackedStringArray("marker_tracking", "right_controller", "left_controller")]
+[node name="ArucoCsvLogger" type="Node" parent="." unique_id=1049745090 node_paths=PackedStringArray("marker_tracking", "right_controller", "left_controller")]
 process_priority = 100
 script = ExtResource("9_csv")
 marker_tracking = NodePath("../ArucoMarkerTracking")
@@ -93,8 +90,8 @@ floor_provider = NodePath("../XROrigin3D")
 [node name="mannequin" parent="AvatarRig" unique_id=580496068 instance=ExtResource("6_mann")]
 transform = Transform3D(0.77, 0, 0, 0, -3.36578e-08, 0.77, 0, -0.77, -3.36578e-08, 0.065894, -0.023727, 0.530701)
 
-[node name="CPRHandZone" parent="AvatarRig/mannequin" node_paths=PackedStringArray("xr_origin", "start_controller") instance=ExtResource("10_cpr")]
-position = Vector3(0, 0.127, 0.12)
+[node name="CPRHandZone" parent="AvatarRig/mannequin" unique_id=505724243 node_paths=PackedStringArray("xr_origin", "start_controller") instance=ExtResource("10_cpr")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.127, 0.12)
 guide_only = false
 xr_origin = NodePath("../../../XROrigin3D")
 start_controller = NodePath("../../../XROrigin3D/RightHand")
@@ -126,10 +123,8 @@ mouse_filter = 2
 expand_mode = 1
 stretch_mode = 5
 
-[node name="LoggerStatus" type="Label" parent="CameraLayer" node_paths=PackedStringArray("avatar_rig")]
+[node name="LoggerStatus" type="Label" parent="CameraLayer" unique_id=1945988655 node_paths=PackedStringArray("avatar_rig")]
 process_priority = 20
-script = ExtResource("11_status")
-avatar_rig = NodePath("../../AvatarRig")
 offset_left = 12.0
 offset_top = 248.0
 offset_right = 420.0
@@ -140,3 +135,5 @@ theme_override_constants/shadow_offset_x = 2
 theme_override_constants/shadow_offset_y = 2
 theme_override_font_sizes/font_size = 18
 text = "Placing avatar…"
+script = ExtResource("11_status")
+avatar_rig = NodePath("../../AvatarRig")

@@ -144,8 +144,8 @@ private:
     // that sits in the right place but visibly wobbles in orientation is that, and the fix is
     // temporal averaging or a multi-marker board, not another lens-pose hunt.
     // RECONCILED in the addon merge. 81468ed put one measured pair here and a DIFFERENT measured
-    // pair in the scene's override (aruco_markers.tscn then, main_3d.tscn since the merge), and the
-    // override is the one that actually ran -- a
+    // pair in the scene's override (aruco_markers.tscn then, main_3d.tscn after the merge,
+    // cpr_trainer.tscn now), and the override is the one that actually ran -- a
     // scene override beats a header default every time, so every number ever verified on device
     // came from the pair below, not from the pair that used to stand here
     // (-0.99520788537121, -0.00260202523029, 0.00286401182712, 0.09770512676372 /

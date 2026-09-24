@@ -15,7 +15,7 @@ extends Node
 ##              by hand from a pose history; is now the addon's head_pose, which comes from
 ##              xrLocateSpace at the frame's own timestamp -- the same quantity, measured better.
 ##              Play space rather than world space, i.e. identical while the XROrigin3D sits at
-##              identity (it does; see main_3d.tscn).
+##              identity (it does; see cpr_trainer.tscn).
 ##   <marker>_* the marker pose in CAMERA space, as before. The addon hands out poses with
 ##              head_pose * lens_pose already applied, so the camera-space value the old pipeline
 ##              logged is recovered exactly by undoing the head pose: head_pose^-1 * play_pose
