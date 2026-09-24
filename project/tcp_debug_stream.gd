@@ -29,11 +29,15 @@ const TCP_PORT := 7007			#view available ports with adb reverse --list
 # also gates on a connected socket, so a closed one stops frames being encoded.
 @export var enabled := false
 
-# Records the WORLD poses of the detected markers -- position AND orientation, independent of the receiver's 'l' key (that
+# RECORDS the WORLD poses of the detected markers -- position AND orientation, independent of the receiver's 'l' key (that
 # one logs reprojection CORNERS into tools/reproj_logs/ and is driven from the laptop). Flip this on
 # in the remote inspector of a running deploy, move around, flip it off: the receiver opens
 # tools/marker_poses/marker_pos_<date>_<time>.csv on the rising edge and closes it on the falling
 # one, so turning the switch OFF is what hands you the finished file.
+#
+# It records rather than enables: the poses themselves travel in EVERY streamed frame regardless
+# (see _put_world_block), so tcp_receiver.py's live 6-DoF overlay is there the whole time and this
+# switch decides only whether what you are already watching also lands in a file.
 #
 # It rides inside the frame the streamer already sends rather than getting a channel of its own,
 # for the same reason the marker blocks do: _tcp_out drains asynchronously, so a second writer would
@@ -229,8 +233,9 @@ func submit(img: Image, corners: Dictionary, poses: Dictionary, head_pose: Trans
 #            the translation keeps its axes because sideways and forwards do not do the same thing
 #            either (see submit). The receiver derives the L2 norm from the three.
 #   world:   recording u32 (0/1), count u32, then per marker id u32 + x,y,z f32 +
-#            qx,qy,qz,qw f32 (32 bytes each) = the marker POSE in WORLD space, i.e. what
-#            record_global_marker_pos records. Last in the frame.
+#            qx,qy,qz,qw f32 (32 bytes each) = the marker POSE in WORLD space. Sent in every frame;
+#            the flag says only whether record_global_marker_pos is on, i.e. whether the receiver
+#            should be writing these to a CSV as well as showing them. Last in the frame.
 #
 # total_size counts ITSELF and everything after it, i.e. it is the whole frame, and it is the reason
 # the rest of this format is safe to extend. It used to be absent, and the invariant that replaced it
@@ -309,7 +314,15 @@ func _put_marker_block(buf: StreamPeerBuffer, markers: Dictionary) -> void:
 			buf.put_float(p.y)
 
 
-# The world-position block: recording u32 (0/1), count u32, then id u32 + x,y,z f32 per marker.
+# The world-position block: recording u32 (0/1), count u32, then id u32 + x,y,z f32 + quat per
+# marker.
+#
+# The POSES ride in every frame, whatever the switch says. Only the FLAG follows
+# record_global_marker_pos, and all it means is "the receiver should be writing these to a file":
+# gating the payload on it would make the receiver's live 6-DoF readout appear and disappear with a
+# recording switch it has nothing to do with, and a readout you have to start a recording to see is
+# one you cannot use to decide whether the recording is worth making. The cost is 32 bytes per
+# marker per frame against a frame that is most of a megabyte.
 #
 # The flag TRAVELS rather than being inferred from count, and that is not redundancy. While
 # recording, a frame in which the detector found nothing also has count 0, so a receiver reading
@@ -332,15 +345,10 @@ func _put_marker_block(buf: StreamPeerBuffer, markers: Dictionary) -> void:
 # this has ever been used in, but a recording made after locomotion is in a different frame than an
 # older one. Compare recordings from the same session.
 func _put_world_block(buf: StreamPeerBuffer, world_poses: Dictionary) -> void:
-	if not record_global_marker_pos:
-		# Eight bytes even when idle, because the receiver reads a FIXED structure per frame -- an
-		# omitted block would leave the frame short of its own total_size (same contract as the two
-		# marker blocks).
-		buf.put_u32(0)
-		buf.put_u32(0)
-		return
-
-	buf.put_u32(1)
+	# The flag only; the poses below go out either way. The block is written unconditionally in any
+	# case, because the receiver reads a FIXED structure per frame -- an omitted block would leave
+	# the frame short of its own total_size (same contract as the two marker blocks).
+	buf.put_u32(1 if record_global_marker_pos else 0)
 	buf.put_u32(world_poses.size())
 	for id in world_poses:
 		buf.put_u32(id)

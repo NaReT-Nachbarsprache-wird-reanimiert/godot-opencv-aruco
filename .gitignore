@@ -52,10 +52,17 @@ __pycache__/
 # re-measured. The .gitkeep files stay so the layout survives an empty checkout.
 #
 # What that costs, and it is worth knowing before a long session: each capture adds its bytes to
-# history permanently. The frames are ~80 KB each and the plot PNGs ~100-800 KB, so a session that
-# streams a hundred stills is a ~10 MB commit. Prune what you did not learn anything from BEFORE
-# committing -- the plots in particular are regenerable from the CSV beside them by re-running the
-# plot script, so a figure is only worth keeping if it is the one being pointed at.
+# history permanently. The frames are ~80 KB each, so a session that streams a hundred stills is a
+# ~3 MB commit. Prune what you did not learn anything from BEFORE committing.
+#
+# The PLOTS are the exception, and they are ignored below. They are DERIVED -- regenerable from the
+# CSV beside them by re-running the plot script -- so they are not evidence for anything the way the
+# capture is, and they are most of the bytes: one session of the marker-pose experiment produced
+# 876 KB of CSV and 1.7 MB of PNG, against ~10 MB for every capture tracked up to that point. A
+# figure that IS the one being pointed at -- quoted in a commit message, a README or an issue -- is
+# still worth keeping, and `git add -f <file>` is how to keep it, deliberately and one at a time.
+tools/marker_poses/marker_pose_plots/*.png
+tools/reproj_logs/*.png
 
 .sconsign*.dblite
 

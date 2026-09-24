@@ -10,10 +10,14 @@ the step sets every scale, and the millimetre structure the log is for collapses
 Find the step in the 'discontinuities' listing, then re-run on either side of it. The range lands in
 the output filenames, so the whole-log figures survive alongside the per-segment ones.
 
-What the log holds: one row per marker per STREAMED frame, `frame,id,x,y,z[,qx,qy,qz,qw]` = the
-marker's POSE in WORLD space, i.e. what came out of solvePnP after head_pose * lens_pose was baked
-onto it. The quaternion columns are present only in logs captured after _put_world_block gained them;
-see ON ROTATION at the bottom of this docstring.
+What the log holds: one row per marker per STREAMED frame, `frame,id,x,y,z[,qx,qy,qz,qw][,edge_px]`
+= the marker's POSE in WORLD space, i.e. what came out of solvePnP after head_pose * lens_pose was
+baked onto it. The quaternion columns are present only in logs captured after _put_world_block
+gained them; see ON ROTATION at the bottom of this docstring. edge_px, newer still, is the apparent
+size of the marker in the frame (mean edge length of the detected quad, computed by tcp_receiver.py)
+and stands in for RANGE -- it goes as fx * marker_size / distance. Nothing here plots it yet; it is
+in the log because a spread is only interpretable against the range it was measured at, and the pose
+columns alone cannot supply one.
 
 Every panel draws a DOT at each recorded sample over a faint connecting line. The line between two
 dots is drawing, not data -- at this sampling rate a short dropout otherwise renders as a smooth
@@ -82,6 +86,11 @@ import numpy as np
 # scripts cannot drift into making different promises about the same kind of panel; see plotlib.py.
 from plotlib import (C_ACCENT, C_AXES, C_INK, C_MUTED, S_AXES, load, mark_offscale,
                      robust_ylim, sample_note, style, trace)
+# The rotation vocabulary, shared with tcp_receiver.py's live 6-DoF readout. Shared for the same
+# reason as plotlib: the euler ORDER and the hemisphere rule are conventions, and a live number that
+# used a second copy of them could disagree with the plot of the very recording it produced.
+from quatmath import (quat_conj, quat_hemisphere, quat_median, quat_mul, quat_to_euler_yxz_deg,
+                      quat_to_matrix, rotvec_deg, unit)
 
 # Every track panel in this file carries the same x axis, and the parenthetical is the whole
 # warning: this is a counter of received frames, so it orders the samples but does not time them.
@@ -172,76 +181,10 @@ def deviations_mm(one):
 def unit_quats(one):
     """The log's four quaternion columns as an (N, 4) array, renormalised.
 
-    Renormalised because they arrive as float32 off the wire and every consumer here assumes unit
-    length -- rotvec_deg reads w as cos(angle/2), quat_to_matrix has no normalising step of its own.
-    One helper rather than the four verbatim copies of this pair of lines this file used to carry:
-    they cannot drift now, and the epsilon guard is stated once.
+    The normalising itself is quatmath.unit -- this is the CSV-shaped wrapper around it, i.e. the
+    one place that knows which columns hold the orientation.
     """
-    q = np.stack([one[c] for c in ROT_COLS], axis=1)
-    return q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
-
-
-def _quat_hemisphere(q):
-    """Flip every sample onto one hemisphere.
-
-    q and -q are the SAME rotation. A log that happens to straddle the sign boundary would
-    otherwise get a component-wise median sitting halfway between two IDENTICAL orientations,
-    which is not an orientation at all -- and every deviation would then be measured from it.
-    """
-    sign = np.sign(q @ q[0])
-    sign[sign == 0.0] = 1.0
-    return q * sign[:, None]
-
-
-def quat_median(q):
-    """Robust central orientation: component-wise median on one hemisphere, renormalised.
-
-    Median rather than mean for the same reason as everywhere else in this file -- the occasional
-    frame where solvePnP picks the wrong branch of the planar ambiguity is off by tens of degrees,
-    and an averaged reference would carry a piece of that into every other frame's deviation.
-    """
-    m = np.median(_quat_hemisphere(q), axis=0)
-    n = float(np.linalg.norm(m))
-    return m / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0])
-
-
-def quat_mul(a, b):
-    """Hamilton product in the (x, y, z, w) component order -- Godot's, so the CSV columns go
-    straight in as they came out of Basis.get_rotation_quaternion()."""
-    ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
-    bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
-    return np.stack([
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz], axis=-1)
-
-
-def quat_conj(q):
-    out = np.array(q, dtype=float, copy=True)
-    out[..., :3] *= -1.0
-    return out
-
-
-def rotvec_deg(q):
-    """Quaternion -> rotation vector (axis * angle) in degrees, along the shortest arc.
-
-    A rotation VECTOR rather than euler angles, deliberately. Euler needs a convention stated to be
-    read at all, wraps at +-180deg, and degenerates at gimbal lock -- three ways for a plot to show
-    a jump that never happened. Taken relative to the median orientation these angles are a couple
-    of degrees, nowhere near any of those failure modes, and each component reads simply as "how far
-    about that world axis".
-    """
-    q = np.atleast_2d(np.asarray(q, dtype=float))
-    # q and -q are the same rotation; picking w >= 0 picks the <=180deg way round.
-    q = q * np.where(q[:, 3:4] < 0.0, -1.0, 1.0)
-    w = np.clip(q[:, 3], -1.0, 1.0)
-    angle = 2.0 * np.arccos(w)
-    sin_half = np.sqrt(np.maximum(1.0 - w * w, 0.0))
-    axis = np.zeros((len(q), 3))
-    ok = sin_half > 1e-9          # at sin_half == 0 the rotation IS identity; axis stays zero
-    axis[ok] = q[ok, :3] / sin_half[ok, None]
-    return np.degrees(axis * angle[:, None])
+    return unit(np.stack([one[c] for c in ROT_COLS], axis=1))
 
 
 def rotation_deviation_deg(one):
@@ -251,48 +194,6 @@ def rotation_deviation_deg(one):
     rel = quat_mul(quat_conj(med)[None, :], q)
     rv = rotvec_deg(rel)
     return med, rv, np.linalg.norm(rv, axis=1)
-
-
-def quat_to_matrix(q):
-    """(N, 4) quaternions in (x, y, z, w) -> (N, 3, 3) rotation matrices."""
-    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], axis=-1),
-        np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], axis=-1),
-        np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], axis=-1),
-    ], axis=1)
-
-
-def quat_to_euler_yxz_deg(q):
-    """Quaternion -> euler angles in degrees, in Godot's DEFAULT order (EULER_ORDER_YXZ).
-
-    The order is the whole reason this function exists rather than a one-liner: euler angles are
-    meaningless without one, and the useful choice is the one the engine that produced the pose
-    uses, so these numbers are directly comparable with Node3D.rotation_degrees in the (remote)
-    inspector. A different order applied to the same rotation gives three different numbers, all
-    correct, none comparable with anything.
-
-    The gimbal-lock branches are transcribed from Basis::get_euler rather than left to fall over:
-    at x = +-90deg the y and z axes coincide, y absorbs the whole remaining rotation and z is
-    pinned to zero. Vectorised through np.where, so the degenerate case costs nothing and cannot
-    produce a NaN that would silently break the line.
-    """
-    m = quat_to_matrix(q)
-    m12 = np.clip(m[:, 1, 2], -1.0, 1.0)
-    locked = np.abs(m12) > 1.0 - 1e-7
-
-    x = np.where(locked, np.copysign(np.pi / 2.0, -m12), np.arcsin(-m12))
-    y = np.where(locked,
-                 np.copysign(1.0, -m12) * np.arctan2(m[:, 0, 1], m[:, 0, 0]),
-                 np.arctan2(m[:, 0, 2], m[:, 2, 2]))
-    z = np.where(locked, 0.0, np.arctan2(m[:, 1, 0], m[:, 1, 1]))
-
-    # Unwrapped before the degree conversion. A marker sitting near the +-180deg seam otherwise
-    # draws a full-scale vertical line every time the angle crosses it -- an artefact of the
-    # representation that looks exactly like the pose flipping, which is the one thing this plot
-    # must not invent. Unwrapping moves the values off the canonical range on purpose; read them
-    # as a continuous track, not as canonical euler angles.
-    return np.degrees(np.unwrap(np.stack([x, y, z], axis=1), axis=0))
 
 
 def net_drift_mm(dev_mm):
@@ -416,7 +317,7 @@ def figure_quat_euler(one, mid):
     full-scale sign flips that are not rotations at all -- q and -q are the same orientation, and
     the device has no reason to prefer one, so the raw stream genuinely does alternate.
     """
-    q = _quat_hemisphere(unit_quats(one))
+    q = quat_hemisphere(unit_quats(one))
     eul = quat_to_euler_yxz_deg(q)
 
     fig, axes = plt.subplots(7, 1, figsize=(13, 14), sharex=True, layout="constrained")
@@ -633,7 +534,7 @@ def report_rotation(one, med, rv_deg, ang_deg):
     # floor on one small planar marker: at or under it there is nothing to chase.
     print("  total angle from median   p50=%.2f  p90=%.2f  max=%.2f  deg"
           % (np.percentile(ang_deg, 50), np.percentile(ang_deg, 90), ang_deg.max()))
-    eul = quat_to_euler_yxz_deg(_quat_hemisphere(unit_quats(one)))
+    eul = quat_to_euler_yxz_deg(quat_hemisphere(unit_quats(one)))
     print("  median euler YXZ (deg, Godot order)   x=%+.2f  y=%+.2f  z=%+.2f"
           % tuple(np.median(eul, axis=0)))
 

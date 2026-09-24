@@ -5,6 +5,12 @@ import numpy as np
 import os
 import time
 
+# The rotation vocabulary, shared with plot_marker_pos.py. Shared rather than copied because the
+# euler ORDER and the median-reference rule are conventions: a live number computed from a second
+# copy of them could disagree with the plot of the very recording it produced. quatmath is numpy
+# only, so this loop does not pull in the plotting stack to convert a quaternion.
+from quatmath import quat_to_euler_yxz_deg, spread_deg
+
 # Where each facility writes. One folder per KIND of capture rather than one shared dump: the three
 # are produced by different switches, read by different scripts and thrown away on different
 # schedules, and a single folder holding all of them made "which files belong to the run I am
@@ -50,7 +56,33 @@ LOG_HEADER = ("frame,id,green_x,green_y,red_x,red_y,dx,dy,dist,"
 # it follows TcpDebugStream.record_global_marker_pos on the device, so it can be started and stopped
 # from the remote inspector with the headset on -- which is the whole point, since 'l' needs a hand
 # on this keyboard. The two can run at the same time and neither knows about the other.
-POS_HEADER = "frame,id,x,y,z,qx,qy,qz,qw\n"
+#
+# edge_px is the mean edge length of the DETECTED quad, computed here rather than sent: it is the
+# apparent size of the marker in the frame, and therefore the log's one handle on RANGE -- it goes
+# as fx * marker_size / distance, so it is the variable a "does the pose estimate get noisier
+# further away" reading has to be plotted against. The pose columns beside it cannot supply that,
+# being play-space coordinates of the marker with no camera position to measure from.
+POS_HEADER = "frame,id,x,y,z,qx,qy,qz,qw,edge_px\n"
+
+# --- the live 6-DoF readout ------------------------------------------------------------------
+#
+# Always on, because the world block now rides in every frame whatever the device's recording switch
+# says (see _put_world_block in tcp_debug_stream.gd). What it shows per marker is the pose as
+# reported plus its rolling SPREAD, and the spread is the part worth having: a single frame's
+# orientation flickers by degrees on a small planar marker, so an instantaneous euler triple is
+# unreadable as a live number, while its scatter over a couple of seconds is stable enough to watch
+# change as you walk toward or away from the marker.
+
+# Samples per rolling window, ~2.5s at the Quest's ~12 detections/s. Long enough that the spread
+# settles, short enough to follow a marker being moved to a new distance without a long tail.
+SPREAD_WINDOW = 30
+# Below this the spread of a handful of samples is mostly the smallness of the sample, so the count
+# is shown instead of a number that would read as a measurement.
+SPREAD_MIN = 8
+# Frames of absence after which the window is thrown away rather than continued. A marker that was
+# out of view for a while is usually back at a different range or angle, and a window straddling
+# both would report the MOVE as scatter -- the one reading this display must not invent.
+SPREAD_GAP = 10
 
 
 def stamped_path(directory, stem, ext):
@@ -204,15 +236,21 @@ def parse_world(cur):
     thrown the quaternion away cannot be re-derived past any of those. plot_marker_pos.py
     converts, and it does so RELATIVE to the median orientation, which sidesteps all three.
 
-    Unlike the two corner blocks this one is not drawn -- it feeds a timestamped marker_pos CSV in
-    marker_poses/, and it exists because the corner overlays answer a question in PIXELS while this
-    answers one in METRES: where the pipeline thinks a marker actually is, and whether that estimate
-    stays put.
+    Unlike the two corner blocks this one is not drawn onto the markers -- it feeds the live 6-DoF
+    readout and a timestamped marker_pos CSV in marker_poses/. It exists because the corner overlays
+    answer a question in PIXELS while this answers one in METRES: where the pipeline thinks a marker
+    actually is, and whether that estimate stays put.
 
-    The recording flag is SENT rather than inferred from count, and reading it that way matters: a
-    frame in which the detector found nothing also has count 0, so closing the file on an empty
-    block would end the log at the first dropout instead of at the switch. Gaps in the file are
-    therefore real gaps in DETECTION, not the end of the recording.
+    The poses arrive in EVERY frame; the recording flag says only whether the device's
+    record_global_marker_pos switch is on, i.e. whether they should be written to a file as well as
+    shown. They used to be gated on that switch, which meant the live readout could only exist while
+    a recording was running -- backwards, since the readout is how you decide whether the recording
+    is worth making.
+
+    The flag is SENT rather than inferred from count, and reading it that way matters: a frame in
+    which the detector found nothing also has count 0, so closing the file on an empty block would
+    end the log at the first dropout instead of at the switch. Gaps in the file are therefore real
+    gaps in DETECTION, not the end of the recording.
 
     Returns (recording, {id: (x, y, z, qx, qy, qz, qw)}).
     """
@@ -305,12 +343,83 @@ def corner_gap(detected, reprojected):
             out[mid] = float(np.mean(np.linalg.norm(d, axis=1)))
     return out
 
+
+def edge_px(quad):
+    """Mean edge length of one detected quad, in pixels of the streamed frame.
+
+    The apparent SIZE of the marker, which is the only range information this receiver has: it goes
+    as fx * marker_size / distance, so it rises as you approach and falls as you back off, with no
+    need to know either fx or the marker's physical size to read it that way.
+
+    Two consumers, and they want it for the same reason from opposite ends. The corner log divides
+    the red-green gap by it, to stop "walking toward the marker" masquerading as "forward motion
+    causes gap" -- range sits in the denominator of the gap formula. The live readout and the
+    position log show it beside the pose spread, because a spread is only interpretable against the
+    range it was measured at.
+    """
+    q = np.asarray(quad, dtype=float).reshape(4, 2)
+    return float(np.mean(np.linalg.norm(q - np.roll(q, 1, axis=0), axis=1)))
+
+
+def rolling_spread(hist, seen, frame_num, world):
+    """Push this frame's poses into the per-id windows; return {id: (rot_deg, pos_mm, n)}.
+
+    rot_deg is the RMS angle about the window's median orientation and pos_mm the RMS distance from
+    its median position -- the scatter of the estimate while the marker is not moving, which is what
+    a single frame cannot show and what changes with range. Both are median-referenced for the usual
+    reason: solvePnP on one small planar marker occasionally picks the wrong branch of its two-fold
+    ambiguity, and a mean reference would spread that one bad frame across every other sample's
+    deviation instead of leaving it as the outlier it is.
+
+    rot_deg and pos_mm come back None until the window holds SPREAD_MIN samples, so the caller can
+    say "filling" rather than print a number that is mostly the smallness of the sample.
+
+    THE caveat, and it is the whole validity of reading range off this: the marker must be still and
+    so must the head. Real motion of either is signal, and this cannot tell it from scatter -- head
+    motion additionally enters through the capture-time pose lookup, which is a different error with
+    a different scaling (velocity, not range).
+    """
+    out = {}
+    for mid, pose in world.items():
+        # A marker that has been away is usually back at a different range or angle; continuing its
+        # old window would report the MOVE as scatter.
+        if frame_num - seen.get(mid, -1 << 30) > SPREAD_GAP:
+            hist.pop(mid, None)
+        seen[mid] = frame_num
+        win = hist.setdefault(mid, collections.deque(maxlen=SPREAD_WINDOW))
+        win.append(pose)
+        if len(win) < SPREAD_MIN:
+            out[mid] = (None, None, len(win))
+            continue
+        arr = np.asarray(win, dtype=float)
+        dev = arr[:, :3] - np.median(arr[:, :3], axis=0)
+        out[mid] = (spread_deg(arr[:, 3:]),
+                    1000.0 * float(np.sqrt(np.mean(np.sum(dev * dev, axis=1)))),
+                    len(win))
+    return out
+
+
+def fit_scale(text, width, base=0.45, margin=16):
+    """Font scale at which `text` still fits across a frame `width` px wide.
+
+    The readout is ~100 characters and the streamed frame's width is whatever the passthrough
+    camera's format happens to be, so a fixed scale either wastes a wide frame or runs a narrow one
+    off the right edge -- silently, since putText clips without complaining.
+    """
+    w = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, base, 1)[0][0]
+    return base if w <= width - margin else base * (width - margin) / max(w, 1)
+
+
 log_file = None
 log_path = None
 # Second, independent log handle -- opened and closed by the DEVICE switch, never by a key here.
 pos_file = None
 pos_path = None
 frame_num = 0
+# Rolling pose windows for the live spread readout, and the frame each id was last seen in (which is
+# what lets a window be discarded after an absence rather than bridged across it).
+pose_hist = {}
+pose_seen = {}
 
 while True:
     log("waiting for frame...")
@@ -333,6 +442,11 @@ while True:
 
     markers = frame.detected
     reprojected = frame.reprojected
+    ids, corners = markers
+    reproj_ids, reproj_corners = reprojected
+    # Apparent marker size per id, needed by three consumers below (the position log, the live
+    # readout, the corner log) -- computed once here rather than in each of them.
+    edges = {mid: edge_px(q) for mid, q in zip(ids, corners)}
     baseline_deg = frame.baseline_deg
     dx_m, dy_m, dz_m = frame.d_local
     baseline_m = float(np.sqrt(dx_m * dx_m + dy_m * dy_m + dz_m * dz_m))
@@ -354,15 +468,16 @@ while True:
     if pos_file is not None:
         for mid in sorted(world_pos):
             x, y, z, qx, qy, qz, qw = world_pos[mid]
-            pos_file.write("%d,%d,%.6f,%.6f,%.6f,%.7f,%.7f,%.7f,%.7f\n"
-                           % (frame_num, mid, x, y, z, qx, qy, qz, qw))
+            # nan rather than a skipped row if the id somehow has a pose but no corners: the pose is
+            # the measurement, edge_px is context, and dropping the row would lose the former to
+            # protect the latter. numpy reads nan back natively, so the column still loads.
+            pos_file.write("%d,%d,%.6f,%.6f,%.6f,%.7f,%.7f,%.7f,%.7f,%.2f\n"
+                           % (frame_num, mid, x, y, z, qx, qy, qz, qw,
+                              edges.get(mid, float("nan"))))
         # Flushed per frame, same reason as the corner log: a run usually ends with Ctrl-C or a dead
         # socket, neither of which reaches the close below, and an unflushed buffer would take the
         # tail of the recording with it.
         pos_file.flush()
-
-    ids, corners = markers
-    reproj_ids, reproj_corners = reprojected
 
     arr = np.frombuffer(frame.data, dtype=np.uint8)
 
@@ -416,6 +531,33 @@ while True:
     cv2.putText(view, status, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1,
                 cv2.LINE_AA)
 
+    # The 6-DoF readout, one line per marker under the status. Pose as reported, then the rolling
+    # spread of that pose and the apparent marker size the spread has to be read against.
+    #
+    # Deliberately BELOW the baselines, because the two answer different questions and mixing them
+    # up is easy: the baselines and the px gap above are about the CALIBRATION (does the pose stay
+    # put as the head moves), while these lines are about the ESTIMATE ITSELF (how much does it
+    # wobble, and with what). Neither validates the other.
+    spreads = rolling_spread(pose_hist, pose_seen, frame_num, world_pos)
+    for row, mid in enumerate(sorted(world_pos)):
+        x, y, z, qx, qy, qz, qw = world_pos[mid]
+        # unwrap=False: a single live pose has no track to stay continuous with, so the canonical
+        # -180..180 range is the right thing to show -- and the sign flip a marker sitting on the
+        # seam produces is a property of euler angles, not of the pose. The spread beside it is
+        # computed from the quaternion and does not see that flip at all, which is the other reason
+        # these three numbers are for reading the orientation and that one is for measuring it.
+        ex, ey, ez = quat_to_euler_yxz_deg(np.array([[qx, qy, qz, qw]]), unwrap=False)[0]
+        rot_sd, pos_sd, n = spreads[mid]
+        line = ("id%-3d p %+.3f %+.3f %+.3f m   r %+7.1f %+7.1f %+7.1f deg   edge %5.1f px"
+                % (mid, x, y, z, ex, ey, ez, edges.get(mid, float("nan"))))
+        if rot_sd is None:
+            line += "   spread: filling %d/%d" % (n, SPREAD_MIN)
+        else:
+            line += "   spread %5.2f deg %5.1f mm (n=%d)" % (rot_sd, pos_sd, n)
+        scale = fit_scale(line, frame.width)
+        cv2.putText(view, line, (8, 44 + int(round(40 * scale)) * row),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 255), 1, cv2.LINE_AA)
+
     if log_file is not None:
         det = dict(zip(ids, corners))
         rep = dict(zip(reproj_ids, reproj_corners))
@@ -427,7 +569,7 @@ while True:
             # toward the marker shrinks r -- which sits in the denominator of the gap
             # formula and would otherwise masquerade as 'forward motion causes gap'.
             # Dimensionless too: gap/green_px needs no marker size to interpret.
-            gpx = float(np.mean(np.linalg.norm(gq - np.roll(gq, 1, axis=0), axis=1)))
+            gpx = edges[mid]
             g = gq[0]
             r = rep[mid].reshape(4, 2)[0]
             log_file.write("%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.4f,%.5f,%.5f,%.5f,%.5f,%.2f\n" % (
