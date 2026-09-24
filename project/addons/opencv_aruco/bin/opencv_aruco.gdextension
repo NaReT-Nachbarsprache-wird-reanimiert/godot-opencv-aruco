@@ -1,11 +1,6 @@
 [configuration]
 
 entry_symbol = "opencv_aruco_library_init"
-; 4.7, not the 4.1 this used to claim. The GDExtension itself would load on 4.1, but the addon
-; around it would not run: OpenXRMarkerTracker, OpenXRSpatialEntityTracker and
-; OpenXRSpatialComponentMarkerList are 4.7 classes, and aruco_marker_tracking.gd names all three.
-; Declaring it here makes a too-old project fail at LOAD, with a message that says which version is
-; needed, instead of at script parse with a list of unknown identifiers.
 compatibility_minimum = "4.7"
 reloadable = false
 
