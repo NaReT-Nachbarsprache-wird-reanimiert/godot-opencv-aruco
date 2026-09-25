@@ -51,18 +51,18 @@ func _ready() -> void:
 	_check(ClassDB.class_exists("OpenXRMarkerTracker"), "OpenXRMarkerTracker class exists")
 	_check(ClassDB.class_exists("OpenCVProcessor"), "OpenCVProcessor GDExtension class exists")
 
-	# Smoke check on the app scene (_ready does not run since the instance never enters the
+	# Smoke check on the demo scene (_ready does not run since the instance never enters the
 	# tree). load()/instantiate() succeed even on script parse errors, missing ext_resources
 	# and assignments to renamed properties -- the engine drops those silently -- so assert the
 	# OUTCOME: scripts actually attached, scene property overrides actually applied.
-	var app_scene: PackedScene = load("res://cpr_trainer.tscn")
-	_check(app_scene != null, "app scene resource loads")
-	if app_scene != null:
-		var app := app_scene.instantiate()
-		_check(app != null, "app scene instantiates")
-		if app != null:
-			_check(app.get_script() == load("res://cpr_trainer.gd"), "app root has its script attached")
-			var amt := app.get_node_or_null("ArucoMarkerTracking")
+	var demo_scene: PackedScene = load("res://main_3d.tscn")
+	_check(demo_scene != null, "demo scene resource loads")
+	if demo_scene != null:
+		var demo := demo_scene.instantiate()
+		_check(demo != null, "demo scene instantiates")
+		if demo != null:
+			_check(demo.get_script() == load("res://main_3d.gd"), "demo root has its script attached")
+			var amt := demo.get_node_or_null("ArucoMarkerTracking")
 			_check(amt is ArucoMarkerTracking, "scene contains an ArucoMarkerTracking with the addon script")
 			if amt is ArucoMarkerTracking:
 				# Anchored on marker_dictionary, not on a marker size. This check exists only to
@@ -72,20 +72,20 @@ func _ready() -> void:
 				# marker_sizes[0] stood here and had to be edited every time someone re-measured a
 				# printed marker, which is how it came to disagree with the scene. Which dictionary
 				# the markers were PRINTED in cannot drift like that.
-				# NOTE this pins the test to a scene whose app runs 4x4_50. A demo scene on the
-				# default dictionary (36h12) cannot express the override at all -- Godot omits
-				# default values from .tscn -- so that branch needs its own value here.
+				# NOTE this pins the test to a demo scene on 4x4_50. Put the demo back on the
+				# default dictionary (36h12) and it cannot express the override at all -- Godot
+				# omits default values from .tscn -- so this check would need another anchor.
 				_check(amt.marker_dictionary == OpenCVProcessor.MARKER_DICT_4X4_50,
 						"scene override for marker_dictionary applied")
 				# The measurement rig is demo-only and attaches by signal, so its absence is silent
 				# by design -- which is exactly why the scene has to assert it is there.
 				_check(amt.get_node_or_null("TcpDebugStream") != null
 						and amt.get_node_or_null("DetectionDiagnostics") != null,
-						"app scene carries both diagnostics nodes under the tracking node")
-			_check(app.get_node_or_null("XROrigin3D/XRCamera3D") != null
-					and app.get_node_or_null("CameraLayer/CameraPreview") != null,
-					"root's @onready node paths exist in the scene")
-			app.free()
+						"demo scene carries both diagnostics nodes under the tracking node")
+			_check(demo.get_node_or_null("XROrigin3D/XRCamera3D") != null
+					and demo.get_node_or_null("CameraLayer/CameraPreview") != null,
+					"demo @onready node paths exist in the scene")
+			demo.free()
 			# Whatever debug_prints_enabled the scene carries, the instantiate above pushed it
 			# into the C++ static (property setter); reset it so the detection below logs nothing.
 			OpenCVProcessor.set_debug_prints_enabled(false)

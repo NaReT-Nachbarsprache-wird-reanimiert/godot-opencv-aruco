@@ -1,0 +1,44 @@
+[gd_scene format=3 uid="uid://catn06b43r1ce"]
+
+[ext_resource type="Script" uid="uid://crxyq5donm67c" path="res://main_3d.gd" id="1_wiwsh"]
+[ext_resource type="Script" uid="uid://df20bwxeyvlj4" path="res://xr_startup.gd" id="2_xr"]
+[ext_resource type="Script" uid="uid://bowhoc6sk1l2c" path="res://addons/opencv_aruco/aruco_marker_tracking.gd" id="3_aruco"]
+[ext_resource type="Script" uid="uid://c0118do55uofq" path="res://tcp_debug_stream.gd" id="4_tcpds"]
+[ext_resource type="Script" uid="uid://bqx4n7dtke5vm" path="res://detection_diagnostics.gd" id="5_diagn"]
+
+[node name="main3d" type="Node3D" unique_id=557024045]
+script = ExtResource("1_wiwsh")
+
+[node name="ArucoMarkerTracking" type="Node" parent="." unique_id=1286694717]
+script = ExtResource("3_aruco")
+marker_sizes = Array[float]([0.1, 0.094, 0.1, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05])
+marker_dictionary = 1
+
+[node name="TcpDebugStream" type="Node" parent="ArucoMarkerTracking" unique_id=1286694718]
+script = ExtResource("4_tcpds")
+enabled = true
+
+[node name="DetectionDiagnostics" type="Node" parent="ArucoMarkerTracking" unique_id=1286694719 node_paths=PackedStringArray("xr_camera", "xr_origin")]
+script = ExtResource("5_diagn")
+xr_camera = NodePath("../../XROrigin3D/XRCamera3D")
+xr_origin = NodePath("../../XROrigin3D")
+
+[node name="XROrigin3D" type="XROrigin3D" parent="." unique_id=436142614]
+script = ExtResource("2_xr")
+
+[node name="XRCamera3D" type="XRCamera3D" parent="XROrigin3D" unique_id=358646954]
+
+[node name="OpenXRMetaEnvironmentDepth" type="OpenXRMetaEnvironmentDepth" parent="XROrigin3D/XRCamera3D" unique_id=1896255835]
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=737078982]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1)
+
+[node name="CameraLayer" type="CanvasLayer" parent="." unique_id=1497644017]
+
+[node name="CameraPreview" type="TextureRect" parent="CameraLayer" unique_id=2069909681]
+custom_minimum_size = Vector2(320, 240)
+offset_right = 320.0
+offset_bottom = 240.0
+mouse_filter = 2
+expand_mode = 1
+stretch_mode = 5
